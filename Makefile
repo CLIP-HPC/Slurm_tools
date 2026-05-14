@@ -16,15 +16,19 @@ node_admintools=nodes/alive nodes/alive_bmc nodes/checktopology nodes/sdrain nod
 
 partitiontools=partitions/showpartitions partitions/showhidden
 
-install: ${pestat} ${usertools} ${jobtools} ${nodetools} ${partitiontools} 
-	cp --no-clobber $^ ${BINDIR}/
+install: ${pestat} ${usertools} ${jobtools} ${nodetools} ${partitiontools}
+	for f in $^; do \
+	  ln -sf "$(abspath $$f)" ${BINDIR}/; \
+	done
 
 install_admintools: ${job_admintools} ${node_admintools} ${accountingtools}
-	cp --no-clobber $^ ${SBINDIR}/
+	for f in $^; do \
+	  ln -sf "$(abspath $$f)" ${SBINDIR}/; \
+	done
 
 # ${slurm_tools_completion}: /etc/profile.d/slurm_tools_completion.sh
 /etc/profile.d/slurm_tools_completion.sh: ${slurm_tools_completion}
-	cp --no-clobber $^ $@
+	ln -sf "$(abspath $^)" $@
 
-all: /etc/profile.d/slurm_tools_completion.sh install install_admintools 
+all: /etc/profile.d/slurm_tools_completion.sh install install_admintools
 
