@@ -47,12 +47,9 @@ partitions = {
 	{ partition="m", has_gpus=false },
 	{ partition="g", has_gpus=true },
 }
--- We do not define the default_partition, so jobs MUST specify partition
-default_partition="c"	-- This partition will be set if none was requested
-default_nodes=1			-- Number of nodes if none was requested
-default_tasks=1			-- Number of tasks if none was requested
 interactive_max_time=240	-- Default maximum time in minutes for all interactive jobs
 default_qos="short"		-- Default QOS if none was requested
+script_error="ERROR: Please modify your batch job script"
 
 -- High-memory node configuration
 highmem = {
@@ -111,56 +108,6 @@ function check_time (job_desc, part_list, submit_uid, log_prefix)
 	return slurm.SUCCESS
 end
 
--- Check for unspecified partition
--- Policy: the partition MUST be specified by the job
-partitions_page="Our partitions are listed in https://docs.vbc.ac.at/books/scientific-computing/chapter/cbenext"
-script_error="ERROR: Please modify your batch job script"
-function check_partition_unspecified (job_desc, part_list, submit_uid, log_prefix)
-	-- Informational web pages
-	local sbatch_msg="Please read the sbatch manual page about setting partitions with -p/--partition"
-	local support_msg="NOTICE: Please contact your local support people if you do not know how to use partitions"
-	-- The case where the job does not specify the partition name
-	if job_desc.partition == nil then
-		slurm.log_info("%s: user %s %s no partition specified", log_prefix, userinfo, badstring)
-		slurm.log_user("WARNING: The compute node partition has not been specified!")
-		slurm.log_user(sbatch_msg)
-		slurm.log_user(partitions_page)
-		slurm.log_user(script_error)
-		slurm.log_user(support_msg)
-		-- Setting partition to the default partition (if defined)
-		if default_partition ~= nil then
-			job_desc.partition = default_partition
-			slurm.log_user("Setting default partition: %s", job_desc.partition)
-			return slurm.SUCCESS
-		else
-			-- Reject jobs that did not specify any partitions
-			return slurm.ESLURM_INVALID_PARTITION_NAME
-		end
-	end
-	return slurm.SUCCESS
-end
-
--- Sanity check of partition
--- The above check_partition_unspecified should be called first
-function check_partition_name (job_desc, part_list, submit_uid, log_prefix)
-	-- Check if the partition name is valid (maybe sbatch already checked this)
-	-- Loop over partitions
-	for i, p in ipairs(partitions) do
-		if string.find(job_desc.partition,p.partition,1,true) == 1 then
-			-- partition name which begins with p.partition
-			return slurm.SUCCESS
-		end
-	end
-	-- No partition was matched
-	-- slurm.log_info("%s: user %s(%u) job_name=%s %s Invalid partition %s specified",
-		-- log_prefix, job_desc.user_name, submit_uid, job_desc.name, badstring, job_desc.partition)
-	slurm.log_info("%s: user %s %s Invalid partition %s specified",
-		log_prefix, userinfo, badstring, job_desc.partition)
-	slurm.log_user("Invalid Slurm partition specified, please specify a valid partition")
-	slurm.log_user(partitions_page)
-	slurm.log_user(script_error)
-	return slurm.ESLURM_INVALID_PARTITION_NAME
-end
 
 -- Sanity check of partition modification
 function modify_partition (job_desc, job_ptr, part_list, modify_uid, log_prefix)
@@ -213,30 +160,6 @@ function check_arg_list (job_desc, part_list, submit_uid, log_prefix)
 	end
 end
 
--- Sanity check of number of nodes (default=slurm.NO_VAL)
-function check_num_nodes (job_desc, part_list, submit_uid, log_prefix)
-	local sbatch_msg="Please read the sbatch manual page about setting nodes with -N/--nodes"
-	if job_desc.min_nodes == slurm.NO_VAL and job_desc.max_nodes == slurm.NO_VAL then
-		slurm.log_user("WARNING: The number of nodes has not been specified!")
-		slurm.log_user(sbatch_msg)
-		if default_nodes ~= nil then
-			job_desc.min_nodes = default_nodes
-			job_desc.max_nodes = default_nodes
-			slurm.log_user("NOTICE: Setting default number of nodes min-max = %u-%u",
-				job_desc.min_nodes, job_desc.max_nodes)
-			return slurm.SUCCESS
-		else
-			-- slurm.log_info("%s: user %s(%u) job_name=%s %s No max_nodes specified, min=0x%x max=0x%x ntasks=0x%x",
-				-- log_prefix, job_desc.user_name, submit_uid, job_desc.name, badstring, job_desc.min_nodes, job_desc.max_nodes, job_desc.num_tasks)
-			slurm.log_info("%s: user %s %s No max_nodes specified, min=0x%x max=0x%x ntasks=0x%x",
-				log_prefix, userinfo, badstring, job_desc.min_nodes, job_desc.max_nodes, job_desc.num_tasks)
-			slurm.log_user(script_error)
-			return slurm.ESLURM_INVALID_NODE_COUNT
-		end
-	else
-		return slurm.SUCCESS
-	end
-end
 
 -- Sanity check of modified number of nodes (default=slurm.NO_VAL)
 function modify_num_nodes (job_desc, job_ptr, part_list, modify_uid, log_prefix)
@@ -249,40 +172,6 @@ function modify_num_nodes (job_desc, job_ptr, part_list, modify_uid, log_prefix)
 	end
 end
 
--- Sanity check of number of tasks (default num_tasks=slurm.NO_VAL)
-function check_num_tasks (job_desc, part_list, submit_uid, log_prefix)
-	-- NOTE: From Slurm 23.02 job_desc.num_tasks may be undefined, see https://bugs.schedmd.com/show_bug.cgi?id=17564
-	-- In https://bugs.schedmd.com/show_bug.cgi?id=17564#c6 --ntasks-per-gpu currently causes num_tasks to be set (might change in the future)
-	local sbatch_msg="Please read the sbatch manual page about setting tasks with -n/--tasks or --ntasks-per-node or --ntasks-per-gpu"
-	if job_desc.num_tasks == slurm.NO_VAL then
-		-- Workaround for Slurm 23.02 where job_desc.num_tasks is undefined at job submission time
-		if job_desc.ntasks_per_node ~= slurm.NO_VAL16 and job_desc.min_nodes ~= slurm.NO_VAL then
-			job_desc.num_tasks = job_desc.ntasks_per_node * job_desc.min_nodes
-			slurm.log_user("Setting number of tasks: %u", job_desc.num_tasks)
-			return slurm.SUCCESS
-		end
-		slurm.log_info("%s: user %s %s No num_tasks specified",
-			log_prefix, userinfo, badstring)
-		slurm.log_user("WARNING: The number of tasks has not been specified!")
-		slurm.log_user(sbatch_msg)
-		if job_desc.min_nodes ~= slurm.NO_VAL then
-			-- Setting 1 task per node
-			job_desc.num_tasks = job_desc.min_nodes
-			slurm.log_user("Setting default number of tasks to the number of nodes: %u", job_desc.num_tasks)
-			return slurm.SUCCESS
-		elseif default_tasks ~= nil then
-			-- Setting the default number of tasks
-			job_desc.num_tasks = default_tasks
-			slurm.log_user("Setting default number of tasks: %u", job_desc.num_tasks)
-			return slurm.SUCCESS
-		else
-			slurm.log_user(script_error)
-			return slurm.ESLURM_BAD_TASK_COUNT
-		end
-	else
-		return slurm.SUCCESS
-	end
-end
 
 -- Sanity check of modified number of tasks (default num_tasks=slurm.NO_VAL)
 function modify_num_tasks (job_desc, job_ptr, part_list, modify_uid, log_prefix)
@@ -392,52 +281,6 @@ function forbid_memory_eq_0 (job_desc, part_list, submit_uid, log_prefix)
 	return slurm.SUCCESS
 end
 
--- Check the match of number of CPUs and tasks
-function check_cpus_tasks (job_desc, part_list, submit_uid, log_prefix)
-	local cpus_per_task = 1		-- Default value
-	-- Informational web page
-	local cpucores_page="See https://docs.vbc.ac.at/books/scientific-computing/chapter/cbenext"
-	if job_desc.cpus_per_task ~= slurm.NO_VAL16 then
-		cpus_per_task = job_desc.cpus_per_task		-- Value has been specified by job script
-	end
-	local num_cpus = 0
-	local has_gpus = false
-	-- Loop over partitions
-	for i, p in ipairs(partitions) do
-		if string.find(job_desc.partition,p.partition,1,true) == 1 then
-			-- partition name which begins with p.partition
-			num_cpus = job_desc.num_tasks * cpus_per_task
-			has_gpus = p.has_gpus
-			break	-- no more partitions to check
-		end
-	end
-	-- Submitting to partial nodes would be OK in case of any unlisted partitions
-	-- Warning: Any UNLISTED partition (if it really exists) may be added to the "partitions" list above!
-	if num_cpus == 0 then
- 		num_cpus = job_desc.num_tasks
-		-- slurm.log_info("%s: WARNING: user %s(%u) job_name=%s for %u nodes in AN UNLISTED partition=%s %s num_tasks=%u cpus_per_task=%u",
-			-- log_prefix, job_desc.user_name, submit_uid, job_desc.name, job_desc.max_nodes, job_desc.partition, badstring, job_desc.num_tasks, cpus_per_task)
-		slurm.log_info("%s: WARNING: user %s for %u nodes in AN UNLISTED partition=%s %s num_tasks=%u cpus_per_task=%u",
-			log_prefix, userinfo, job_desc.max_nodes, job_desc.partition, badstring, job_desc.num_tasks, cpus_per_task)
-	end
-	-- Note: Maybe we can use total_cpus or max_cpus_per_node here?
-	-- The check below is only for non-GPU-nodes /OHN, 11-Oct-2024, requested by user mohsa
-	if not has_gpus and num_cpus ~= job_desc.num_tasks * cpus_per_task then
-		-- Log this job to slurmctld.log:
-		-- slurm.log_info("%s: user %s(%u) job_name=%s for %u nodes in partition %s %s num_tasks=%u cpus_per_task=%u",
-			-- log_prefix, job_desc.user_name, submit_uid, job_desc.name, job_desc.max_nodes, job_desc.partition, badstring, job_desc.num_tasks, cpus_per_task)
-		slurm.log_info("%s: user %s for %u nodes in partition %s %s num_tasks=%u cpus_per_task=%u",
-			log_prefix, userinfo, job_desc.max_nodes, job_desc.partition, badstring, job_desc.num_tasks, cpus_per_task)
-		-- Message to the user:
-		slurm.log_user("NOTICE: CPU/task mismatch for %u nodes in partition %s!", job_desc.max_nodes, job_desc.partition)
-		slurm.log_user(cpucores_page)
-		slurm.log_user("This job runs %u tasks with %u cpus_per_task but %u CPUs were expected.", job_desc.num_tasks, cpus_per_task, num_cpus)
-		slurm.log_user(script_error)
-		return slurm.ESLURM_BAD_TASK_COUNT
-	else
-		return slurm.SUCCESS
-	end
-end
 
 -- Check if GPU partitions are used correctly
 function check_gpus (job_desc, part_list, submit_uid, log_prefix)
@@ -447,18 +290,21 @@ function check_gpus (job_desc, part_list, submit_uid, log_prefix)
 			-- Code adapted from https://lists.schedmd.com/pipermail/slurm-users/2020-December/006459.html
 			if string.find(job_desc.partition,p.partition,1,true) == 1 then
 				-- partition name begins with p.partition
-				if job_desc.gres == nil then
-						-- No GRES specified
-						slurm.log_info("%s: user %s %s No GRES specified for GPU partition %s",
-							log_prefix, userinfo, badstring, job_desc.partition)
-						slurm.log_user("No GRES was specified, GRES must be 1 or more GPUs in partition %s",
-							job_desc.partition)
-						slurm.log_user(script_error)
-						return slurm.ESLURM_INVALID_GRES
-				elseif job_desc.gres ~= nil then
+				if job_desc.gres ~= nil then
 					if string.find(job_desc.gres, "gpu") then
-						-- Get number of GPUs specified
+						-- Get number of GPUs specified and validate the count
 						local numgpu = string.match(job_desc.gres, ":%d+$")
+						if numgpu ~= nil then
+							numgpu = numgpu:gsub(':', '')
+							if tonumber(numgpu) < 1 then
+								-- Alert on invalid gpu count - eg: gpu:0 , gpu:p100:0
+								slurm.log_info("%s: user %s %s Invalid GPU count specified in GRES",
+									log_prefix, userinfo, badstring)
+								slurm.log_user("Invalid GPU count specified in GRES, must be greater than 0")
+								slurm.log_user(script_error)
+								return slurm.ESLURM_INVALID_GRES
+							end
+						end
 					else
 						-- GRES specified but no "gpu" was given
 						slurm.log_info("%s: user %s %s No GPUs specified in GRES for GPU partition %s",
@@ -468,28 +314,21 @@ function check_gpus (job_desc, part_list, submit_uid, log_prefix)
 						slurm.log_user(script_error)
 						return slurm.ESLURM_INVALID_GRES
 					end
-					if numgpu ~= nil then
-						numgpu = numgpu:gsub(':', '')
-						if tonumber(numgpu) < 1 then
-							-- Alert on invalid gpu count - eg: gpu:0 , gpu:p100:0
-							slurm.log_info("%s: user %s %s Invalid GPU count specified in GRES",
-								log_prefix, userinfo, badstring)
-							slurm.log_user("Invalid GPU count specified in GRES, must be greater than 0")
-							slurm.log_user(script_error)
-							return slurm.ESLURM_INVALID_GRES
-						end
+				elseif job_desc.tres_per_node ~= nil or job_desc.tres_per_socket ~= nil or job_desc.tres_per_task ~= nil then
+					-- Alternative use of gpus in newer versions of slurm
+					if job_desc.num_tasks == slurm.NO_VAL then
+						slurm.log_user("--gpus-per-task option requires --tasks specification")
+						slurm.log_user(script_error)
+						return slurm.ESLURM_BAD_TASK_COUNT
 					end
-				--Alternative use of gpus in newer versions of slurm
-				elseif job_desc.tres_per_node == nil and job_desc.tres_per_socket == nil and job_desc.tres_per_task == nil then
-					slurm.log_info("%s: user %s %s No GPUs requested for GPU partition %s",
+				else
+					-- No GRES specified
+					slurm.log_info("%s: user %s %s No GRES specified for GPU partition %s",
 						log_prefix, userinfo, badstring, job_desc.partition)
-					slurm.log_user("You tried submitting to a GPU partition, but you did not request any GPU with GRES or GPUS")
+					slurm.log_user("No GRES was specified, GRES must be 1 or more GPUs in partition %s",
+						job_desc.partition)
 					slurm.log_user(script_error)
 					return slurm.ESLURM_INVALID_GRES
-				elseif job_desc.num_tasks == slurm.NO_VAL then
-					slurm.log_user("--gpus-per-task option requires --tasks specification")
-					slurm.log_user(script_error)
-					return slurm.ESLURM_BAD_TASK_COUNT
 				end
 				break	-- no more partitions to check
 			end
@@ -546,9 +385,9 @@ function slurm_job_submit(job_desc, part_list, submit_uid)
 
 	-- Loop over the function list
 	-- We will call these functions in the order listed
-	local functionlist = { check_arg_list, forbid_reserved_name, check_partition_unspecified, check_partition_name, set_qos,
+	local functionlist = { check_arg_list, forbid_reserved_name, set_qos,
 		check_interactive_job, check_time, check_big_memory, check_memory,
-		check_num_nodes, check_num_tasks, forbid_memory_eq_0, check_cpus_tasks, check_gpus }
+		forbid_memory_eq_0, check_gpus }
 
 	local check = slurm.SUCCESS
 	for i, func in ipairs(functionlist) do
@@ -591,7 +430,6 @@ function slurm_job_modify(job_desc, job_ptr, part_list, modify_uid)
 		end
 	end
 	-- Loop over the function list no. 2 for checking job_desc as well as job_ptr
-	-- local functionlist2 = { modify_partition, modify_num_nodes, modify_num_tasks }
 	local functionlist2 = { modify_partition, modify_num_nodes, modify_num_tasks }
 	for i, func in ipairs(functionlist2) do
 		check = func(job_desc, job_ptr, part_list, modify_uid, log_prefix)
