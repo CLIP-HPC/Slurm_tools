@@ -41,22 +41,25 @@ slurm.ESLURM_INVALID_GRES=2072
 -- Define our partitions and defaults
 --
 partitions = {
-	-- partition name (NOTE: a substring which begins the name), number of cores, entire node is 0/1, number of gpus
+	-- partition name (NOTE: a substring which begins the name), has gpus
 	-- Multiple partitions can be lumped together, for example, xeon24, xeon24_512, xeon24_1024 as "xeon24"
-	{ partition="xeon24", numcores=24, entirenode=0, num_gpus=0 },
-	{ partition="xeon32", numcores=32, entirenode=0, num_gpus=0 },
-	{ partition="xeon40", numcores=40, entirenode=1, num_gpus=0 },
-	{ partition="xeon56", numcores=56, entirenode=1, num_gpus=0 },
-	{ partition="sm3090", numcores=80, entirenode=0, num_gpus=10 },
-	{ partition="epyc96", numcores=96, entirenode=1, num_gpus=0 },
-	{ partition="a100", numcores=128, entirenode=0, num_gpus=4 },
-	{ partition="h200", numcores=96, entirenode=0, num_gpus=4 }
+	{ partition="c", has_gpus=false },
+	{ partition="m", has_gpus=false },
+	{ partition="g", has_gpus=true },
 }
 -- We do not define the default_partition, so jobs MUST specify partition
--- default_partition="xeon24el8"	-- This partition will be set if none was requested
+default_partition="c"	-- This partition will be set if none was requested
 default_nodes=1			-- Number of nodes if none was requested
 default_tasks=1			-- Number of tasks if none was requested
 interactive_max_time=240	-- Default maximum time in minutes for all interactive jobs
+default_qos="short"		-- Default QOS if none was requested
+
+-- High-memory node configuration
+highmem = {
+	partition="m",			-- Partition name prefix for high-memory nodes
+	min_mem_per_node=700000,	-- Minimum memory per node in MB
+	cores_per_node=32,		-- Cores per node (used to derive minimum memory per CPU)
+}
 
 --
 -- Define functions to be used
@@ -100,9 +103,17 @@ function check_interactive_job (job_desc, part_list, submit_uid, log_prefix)
 	return slurm.SUCCESS
 end
 
+-- Warn if no time limit is specified
+function check_time (job_desc, part_list, submit_uid, log_prefix)
+	if job_desc.time_limit == slurm.NO_VAL then
+		slurm.log_user("WARNING: No --time specified. Specify --time <walltime> to increase the chances that the scheduler uses this job for backfilling!")
+	end
+	return slurm.SUCCESS
+end
+
 -- Check for unspecified partition
 -- Policy: the partition MUST be specified by the job
-partitions_page="Our partitions are listed in https://wiki.fysik.dtu.dk/Niflheim_users/Niflheim_Getting_Started/#compute-node-partitions"
+partitions_page="Our partitions are listed in https://docs.vbc.ac.at/books/scientific-computing/chapter/cbenext"
 script_error="ERROR: Please modify your batch job script"
 function check_partition_unspecified (job_desc, part_list, submit_uid, log_prefix)
 	-- Informational web pages
@@ -304,13 +315,11 @@ end
 
 -- Check usage of big-memory nodes using --mem=xxx etc.
 function check_big_memory (job_desc, part_list, submit_uid, log_prefix)
-	-- Policy: Define acceptable lower limits on memory on a 4 TB node (32 cores)
-	local min_mem_per_node = 700000
-	local cores_per_node = 32
-	local min_mem_per_cpu = min_mem_per_node / cores_per_node
-	local usage_page="https://wiki.fysik.dtu.dk/Niflheim_users/Niflheim_Getting_Started/#usage-of-big-memory-nodes"
-	-- This check only applies to xeon32* partitions (return otherwise)
-	if string.find(job_desc.partition,"xeon32_") == nil then
+	local min_mem_per_node = highmem.min_mem_per_node
+	local min_mem_per_cpu = highmem.min_mem_per_node / highmem.cores_per_node
+	local usage_page="https://docs.vbc.ac.at/books/scientific-computing/chapter/cbenext"
+	-- This check only applies to the high-memory partition (return otherwise)
+	if string.find(job_desc.partition, highmem.partition, 1, true) ~= 1 then
 		return slurm.SUCCESS
 	end
 	if job_desc.min_mem_per_node == nil and job_desc.min_mem_per_cpu == nil then
@@ -340,6 +349,30 @@ function check_big_memory (job_desc, part_list, submit_uid, log_prefix)
 	return slurm.SUCCESS
 end
 
+-- Warn if a single-node job on the regular compute partition requests a high memory/core ratio
+function check_memory (job_desc, part_list, submit_uid, log_prefix)
+	local good_mem_core_ratio = 5000	-- MB per core considered a normal request
+	-- Only applies to the regular compute partition
+	if string.find(job_desc.partition, "c", 1, true) ~= 1 then
+		return slurm.SUCCESS
+	end
+	-- Only warn for single-node jobs
+	if job_desc.min_nodes ~= slurm.NO_VAL and job_desc.min_nodes > 1 then
+		return slurm.SUCCESS
+	end
+	local mem_per_core = 4096 / job_desc.min_cpus
+	if job_desc.min_mem_per_node ~= nil then
+		mem_per_core = job_desc.min_mem_per_node / job_desc.min_cpus
+	end
+	if job_desc.min_mem_per_cpu ~= nil then
+		mem_per_core = job_desc.min_mem_per_cpu
+	end
+	if mem_per_core > 2 * good_mem_core_ratio then
+		slurm.log_user("WARNING: Job requested a high memory/core ratio (%s MB/core). Consider submitting to the 'm' partition for faster scheduling and better resource utilization!", mem_per_core)
+	end
+	return slurm.SUCCESS
+end
+
 -- Forbid unlimited memory using --mem=0 etc.
 function forbid_memory_eq_0 (job_desc, part_list, submit_uid, log_prefix)
 	local checklist = {
@@ -360,29 +393,21 @@ function forbid_memory_eq_0 (job_desc, part_list, submit_uid, log_prefix)
 end
 
 -- Check the match of number of CPUs and tasks
--- Policy: We require the use of entire nodes for some partitions (xeon40 etc.)
--- as defined by "entirenode" in the "partitions" table.
 function check_cpus_tasks (job_desc, part_list, submit_uid, log_prefix)
 	local cpus_per_task = 1		-- Default value
 	-- Informational web page
-	local cpucores_page="See https://wiki.fysik.dtu.dk/Niflheim_users/Niflheim_Getting_Started/#usage-of-multi-cpu-nodes"
+	local cpucores_page="See https://docs.vbc.ac.at/books/scientific-computing/chapter/cbenext"
 	if job_desc.cpus_per_task ~= slurm.NO_VAL16 then
 		cpus_per_task = job_desc.cpus_per_task		-- Value has been specified by job script
 	end
 	local num_cpus = 0
-	local num_gpus = 0
+	local has_gpus = false
 	-- Loop over partitions
 	for i, p in ipairs(partitions) do
 		if string.find(job_desc.partition,p.partition,1,true) == 1 then
 			-- partition name which begins with p.partition
-			if p.entirenode > 0 or job_desc.max_nodes > 1 then
-				-- Multi-node jobs must use entire nodes
- 				num_cpus = job_desc.max_nodes * p.numcores
-			else
-				-- Submitting to 1 partial node is OK for these partitions
- 				num_cpus = job_desc.num_tasks * cpus_per_task
-			end
-			num_gpus = p.num_gpus	-- Number of GPUs in this partition
+			num_cpus = job_desc.num_tasks * cpus_per_task
+			has_gpus = p.has_gpus
 			break	-- no more partitions to check
 		end
 	end
@@ -397,16 +422,16 @@ function check_cpus_tasks (job_desc, part_list, submit_uid, log_prefix)
 	end
 	-- Note: Maybe we can use total_cpus or max_cpus_per_node here?
 	-- The check below is only for non-GPU-nodes /OHN, 11-Oct-2024, requested by user mohsa
-	if num_gpus == 0 and num_cpus ~= job_desc.num_tasks * cpus_per_task then
+	if not has_gpus and num_cpus ~= job_desc.num_tasks * cpus_per_task then
 		-- Log this job to slurmctld.log:
 		-- slurm.log_info("%s: user %s(%u) job_name=%s for %u nodes in partition %s %s num_tasks=%u cpus_per_task=%u",
 			-- log_prefix, job_desc.user_name, submit_uid, job_desc.name, job_desc.max_nodes, job_desc.partition, badstring, job_desc.num_tasks, cpus_per_task)
 		slurm.log_info("%s: user %s for %u nodes in partition %s %s num_tasks=%u cpus_per_task=%u",
 			log_prefix, userinfo, job_desc.max_nodes, job_desc.partition, badstring, job_desc.num_tasks, cpus_per_task)
 		-- Message to the user:
-		slurm.log_user("NOTICE: Jobs for %u nodes in partition %s must use entire nodes!", job_desc.max_nodes, job_desc.partition)
+		slurm.log_user("NOTICE: CPU/task mismatch for %u nodes in partition %s!", job_desc.max_nodes, job_desc.partition)
 		slurm.log_user(cpucores_page)
-		slurm.log_user("This job requests %u cpus but only runs %u tasks and %u cpus_per_task.", num_cpus, job_desc.num_tasks, cpus_per_task)
+		slurm.log_user("This job runs %u tasks with %u cpus_per_task but %u CPUs were expected.", job_desc.num_tasks, cpus_per_task, num_cpus)
 		slurm.log_user(script_error)
 		return slurm.ESLURM_BAD_TASK_COUNT
 	else
@@ -418,12 +443,12 @@ end
 function check_gpus (job_desc, part_list, submit_uid, log_prefix)
 	-- Loop over partitions
 	for i, p in ipairs(partitions) do
-		if p.num_gpus > 0 then
+		if p.has_gpus then
 			-- Code adapted from https://lists.schedmd.com/pipermail/slurm-users/2020-December/006459.html
 			if string.find(job_desc.partition,p.partition,1,true) == 1 then
 				-- partition name begins with p.partition
 				if job_desc.gres == nil then
-						-- No GRES specified 
+						-- No GRES specified
 						slurm.log_info("%s: user %s %s No GRES specified for GPU partition %s",
 							log_prefix, userinfo, badstring, job_desc.partition)
 						slurm.log_user("No GRES was specified, GRES must be 1 or more GPUs in partition %s",
@@ -473,6 +498,21 @@ function check_gpus (job_desc, part_list, submit_uid, log_prefix)
 	return slurm.SUCCESS
 end
 
+-- Construct and set the final QOS as "<partition>_<qos>"
+function set_qos (job_desc, part_list, submit_uid, log_prefix)
+	local qos = job_desc.qos
+	if qos == nil then
+		qos = default_qos
+	end
+	-- Skip if QOS already contains '_', meaning it has already been formatted
+	if string.find(qos, '_') then
+		return slurm.SUCCESS
+	end
+	local result_qos = job_desc.partition .. '_' .. qos
+	job_desc.qos = result_qos
+	slurm.log_info("%s: user %s setting QOS to %s", log_prefix, userinfo, result_qos)
+	return slurm.SUCCESS
+end
 
 -- Sets a global string "userinfo" containing user, account and job information for this job
 function get_userinfo (job_desc, part_list, submit_uid)
@@ -502,17 +542,17 @@ function slurm_job_submit(job_desc, part_list, submit_uid)
 	if submit_uid == 0 then
 		return slurm.SUCCESS
 	end
-	get_userinfo(job_desc, part_list, submit_uid) 
+	get_userinfo(job_desc, part_list, submit_uid)
 
 	-- Loop over the function list
 	-- We will call these functions in the order listed
-	local functionlist = { check_arg_list, forbid_reserved_name, check_partition_unspecified, check_partition_name, 
-		check_interactive_job, check_big_memory,
+	local functionlist = { check_arg_list, forbid_reserved_name, check_partition_unspecified, check_partition_name, set_qos,
+		check_interactive_job, check_time, check_big_memory, check_memory,
 		check_num_nodes, check_num_tasks, forbid_memory_eq_0, check_cpus_tasks, check_gpus }
 
 	local check = slurm.SUCCESS
 	for i, func in ipairs(functionlist) do
-		check = func(job_desc, part_list, submit_uid, log_prefix) 
+		check = func(job_desc, part_list, submit_uid, log_prefix)
 		if check ~= slurm.SUCCESS then
 			return check
 		end
@@ -529,13 +569,13 @@ function slurm_job_modify(job_desc, job_ptr, part_list, modify_uid)
 	-- modify_uid (input) user ID initiating the request.
 	local log_prefix = 'slurm_job_modify'
 
-	--Don't block/modify any update from root 
+	--Don't block/modify any update from root
 	if modify_uid == nil then
 		return slurm.ESLURM_USER_ID_MISSING
 	elseif modify_uid == 0 then
 		return slurm.SUCCESS
 	end
-	get_userinfo(job_desc, part_list, modify_uid) 
+	get_userinfo(job_desc, part_list, modify_uid)
 
 	-- Loop over the function list no. 1 for checking job_desc
 	-- We will call these functions in the order listed
@@ -545,7 +585,7 @@ function slurm_job_modify(job_desc, job_ptr, part_list, modify_uid)
 	-- Warning: Calling log_user() from slurm_job_modify() fails when using Slurm < 23.02
 	-- See https://bugs.schedmd.com/show_bug.cgi?id=14539
 	for i, func in ipairs(functionlist1) do
-		check = func(job_desc, modify_uid, log_prefix) 
+		check = func(job_desc, modify_uid, log_prefix)
 		if check ~= slurm.SUCCESS then
 			return check
 		end
@@ -554,7 +594,7 @@ function slurm_job_modify(job_desc, job_ptr, part_list, modify_uid)
 	-- local functionlist2 = { modify_partition, modify_num_nodes, modify_num_tasks }
 	local functionlist2 = { modify_partition, modify_num_nodes, modify_num_tasks }
 	for i, func in ipairs(functionlist2) do
-		check = func(job_desc, job_ptr, part_list, modify_uid, log_prefix) 
+		check = func(job_desc, job_ptr, part_list, modify_uid, log_prefix)
 		if check ~= slurm.SUCCESS then
 			return check
 		end
