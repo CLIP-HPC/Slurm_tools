@@ -67,7 +67,7 @@ function check_interactive_job (job_desc, part_list, submit_uid, log_prefix)
 	if job_desc.script == nil or job_desc.script == "" then
 		-- Job script is missing, so we assume that this is an interactive job
 		slurm.log_info("%s: user %s submitted an interactive job to partition(s) %s",
-			log_prefix, userinfo, job_desc.partition)
+			log_prefix, userinfo, job_desc.partition or "(default)")
 		slurm.log_user("NOTICE: Job script is missing, assuming an interactive job")
 		local max_time = interactive_max_time
 		if job_desc.partition == nil or job_desc.partition == "" then	-- Just a sanity check of partition
@@ -340,6 +340,8 @@ end
 -- Construct and set the final QOS as "<partition>_<qos>"
 function set_qos (job_desc, part_list, submit_uid, log_prefix)
 	local qos = job_desc.qos
+	local submit_part = job_desc.partition
+	local is_grid_job = submit_part == "grid"
 	if qos == nil then
 		qos = default_qos
 	end
@@ -347,8 +349,19 @@ function set_qos (job_desc, part_list, submit_uid, log_prefix)
 	if string.find(qos, '_') then
 		return slurm.SUCCESS
 	end
-	local result_qos = job_desc.partition .. '_' .. qos
+	if submit_part == nil then
+      for name, part in pairs(part_list) do
+        if part.flag_default ~= 0 then
+          submit_part = part.name
+		  slurm.log_info("%s: Job from user %s setting default partition value: %s",
+									log_prefix, userinfo, submit_part)
+          break
+        end
+       end
+     end
+	local result_qos = submit_part .. '_' .. qos
 	job_desc.qos = result_qos
+	job_desc.partition = submit_part
 	slurm.log_info("%s: user %s setting QOS to %s", log_prefix, userinfo, result_qos)
 	return slurm.SUCCESS
 end
@@ -424,7 +437,7 @@ function slurm_job_modify(job_desc, job_ptr, part_list, modify_uid)
 	-- Warning: Calling log_user() from slurm_job_modify() fails when using Slurm < 23.02
 	-- See https://bugs.schedmd.com/show_bug.cgi?id=14539
 	for i, func in ipairs(functionlist1) do
-		check = func(job_desc, modify_uid, log_prefix)
+		check = func(job_desc, part_list, modify_uid, log_prefix)
 		if check ~= slurm.SUCCESS then
 			return check
 		end
