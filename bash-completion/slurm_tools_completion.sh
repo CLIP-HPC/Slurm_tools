@@ -25,18 +25,29 @@ then
 			__slurm_compreply_list "$(__slurm_nodes)" "ALL" "true"
 		}
 
+		function _slurm_tools_squeue() {
+			_squeue squeue "$2" "$3"
+		}
+
+		function _slurm_tools_sinfo() {
+			_sinfo sinfo "$2" "$3"
+		}
+
 		# Add Slurm completion for these commands:
-		complete -o nospace -F _squeue pestat
-		complete -o nospace -F _squeue showpower
-		complete -o nospace -F _squeue showuserjobs
-		complete -o nospace -F _squeue jobnice
-		complete -o nospace -F _squeue showuserlimits
-		complete -o nospace -F _squeue showevents
-		complete -o nospace -F _squeue showjobreasons
-		complete -o nospace -F _squeue slurmusersettings
-		complete -o nospace -F _sinfo showpartitions
-		complete -o nospace -F _sinfo slurmacct
-		complete -o nospace -F _sinfo jobstats
+
+		complete -o nospace -F _slurm_tools_squeue pestat
+		complete -o nospace -F _slurm_tools_squeue showpower
+		complete -o nospace -F _slurm_tools_squeue showuserjobs
+		complete -o nospace -F _slurm_tools_squeue jobnice
+		complete -o nospace -F _slurm_tools_squeue showuserlimits
+		complete -o nospace -F _slurm_tools_squeue showevents
+		complete -o nospace -F _slurm_tools_squeue showjobreasons
+		complete -o nospace -F _slurm_tools_squeue slurmusersettings
+
+		complete -o nospace -F _slurm_tools_sinfo showpartitions
+		complete -o nospace -F _slurm_tools_sinfo slurmacct
+		complete -o nospace -F _slurm_tools_sinfo jobstats
+
 		complete -o nospace -F _hostlist shownode
 		complete -o nospace -F _hostlist sdrain
 		complete -o nospace -F _hostlist sresume
