@@ -1,5 +1,6 @@
-BINDIR=/usr/local/bin
-SBINDIR=/usr/local/sbin
+PREFIX ?= /usr/local
+BINDIR=$(PREFIX)/bin
+SBINDIR=$(PREFIX)/sbin
 
 pestat=pestat/pestat
 slurm_tools_completion=bash-completion/slurm_tools_completion.sh
