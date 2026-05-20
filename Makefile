@@ -8,7 +8,7 @@ slurm_tools_completion=bash-completion/slurm_tools_completion.sh
 usertools=showuserjobs/showuserjobs showuserlimits/showuserlimits
 accountingtools=slurmacct/slurmacct slurmacct/jobstats slurmacct/topreports slurmreportmonth/slurmreportmonth
 
-jobtools=jobs/joblist jobs/psjob jobs/showjob jobs/showjobreasons
+jobtools=jobs/joblist jobs/psjob jobs/showjob jobs/showjobreasons jobs/jobinfo jobs/jobeff
 job_admintools=jobs/jobnice jobs/jobqos jobs/jobtimelimit jobs/notifybadjob jobs/sbadjobs jobs/schedjobs jobs/sratelimit jobs/warn_maxjobs
 
 nodetools=nodes/psnode nodes/shownode nodes/showevents nodes/showpower nodes/showpower_nvidia

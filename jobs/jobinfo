@@ -1,0 +1,767 @@
+#!/usr/bin/env python3
+# -*- coding, utf-8 -*-
+#
+# jobinfo - collect job information from Slurm
+#
+# Written by Fokke Dijkstra <f.dijkstra@rug.nl>
+# University of Groningen, NL
+#
+# Inspired by https://github.com/birc-aeh/slurm-utils/blob/master/jobinfo
+# from Anders Halager  <aeh@birc.au.dk>
+#
+# LICENSE, MIT
+
+import sys
+import subprocess
+import argparse
+import datetime
+import math
+import re
+
+# Parameters affecting when hints about job performance will be given.
+MIN_WALLTIME = 180         # Minimum walltime needed before printing job hints
+MIN_MEMORY_FRACTION = 0.75 # Minimum fraction of the requested memory that should be used
+MIN_MEMORY = 2.0           # Minimum amount of memory that can be requested without triggering warnings
+MIN_MEMORY_CORE = 1.5      # Minimum amount of memory that may be left unused per core (GB)
+MIN_GPU_MEMORY = 32        # Minimum amount of memory that is always available on a GPU node (GB)
+
+# Value to use for missing data
+missing_data = '--'
+
+# Minimum uid for generic users (not operators)
+min_user_uid = 10000
+
+def byte_size(s=None):
+    """Convert values with suffix to bytes, return -1.0 for missing data"""
+    # Check for missing or strange values
+    if s is None or s == "16?" or s == '--' or s == '':
+        return -1.0
+    m = {'K': 10, 'M': 20, 'G': 30, 'T': 40, 'P': 50, 'E': 60}
+    scale = 2**m.get(s[-1], 0)
+    if scale != 1:
+        s = s[:-1]
+    return scale * float(s)
+
+def format_bs(x):
+    """Format x as bytes with the appropriate suffix"""
+    if x == missing_data:
+        return x
+    postfix = ' KMGTPE'
+    e = int(math.log(x + 1, 2) / 10)
+    return "{:.2f}{}".format(x / 2**(10 * e), postfix[e])
+
+def f_time(x, output_data):
+    """Format the time value in x aligned to the other time values in output_data"""
+    all_times = [output_data['Timelimit'], output_data['Elapsed'], output_data['TotalCPU'], '-']
+    days_len = max(len(y.split('-')[0]) for y in all_times if '-' in y)
+    ss, mm, hh, dd = parse_time(x)
+    if days_len == 0:
+        dd = ""
+    else:
+        if dd > 0:
+            dd = ("{:d}-".format(dd)).rjust(days_len + 1)
+        else:
+            dd = " " * (days_len + 1)
+    res = '{}{:02d}:{:02d}:{:02.0f}'.format(dd, hh, mm, ss)
+    if res.strip() == '00:00:00':
+        return missing_data
+    return res
+
+def parse_time(t):
+    """Transform a dd-hh:mm:ss value into days, hours, minutes and seconds"""
+    # Format: [DD-[hh:]]mm:ss
+    time_parts = re.compile(r'\s*(((?P<days>\d+)-)?(?P<hours>\d\d):)?' +
+                            r'(?P<minutes>\d\d):(?P<seconds>\d\d(\.\d+)?)')
+    m = time_parts.match(t)
+    if m is None:
+        return 0.0, 0, 0, 0
+    ss = float(m.group('seconds'))
+    mm = int(m.group('minutes'))
+    hh = int(m.group('hours') or '0')
+    dd = int(m.group('days') or '0')
+    return ss, mm, hh, dd
+
+def timestring_to_seconds(timestring):
+    """Transform a dd-hh:mm:ss value into seconds as a floating point value"""
+    ss, mm, hh, dd = parse_time(timestring)
+    return dd * 24 * 60 * 60 + hh * 60 * 60 + mm * 60 + ss
+
+def date_max(a, b):
+    """Return the maximum date value, allowing for 'UNLIMITED' or 'INVALID'"""
+    if 'UNLIMITED' in [a, b]:
+        return 'UNLIMITED'
+    if a in ['', 'INVALID']:
+        return b
+    if b in ['', 'INVALID']:
+        return a
+    return max(a, b)
+
+def tres_key(key, s=None):
+    """Search for 'key=value' in string s and return numeric value, potentially with suffix"""
+    if s is None or s == '':
+        return None
+    value = re.search(fr'(?<=,{key}=)([0-9\.]+[KMGTPE]?)'.format(key), s)
+    if value == None:
+       return None
+    else:
+       return byte_size(value.group(1))
+
+def tres_gpu(s=None):
+    """Search for gpu requests in is of the form gres/gpu:type=count or gres/gpu=count"""
+    if s is None or s == '':
+        return None
+    # This assumes gres/gpu:type=count is always before gres/gpu=count
+    value = re.search(r'(?<=,gres/gpu[:=])([^,]+)[,$]', s)
+    if value == None:
+       return None
+    else:
+       return value.group(1)
+
+def get_first(jobstate, name, fieldname):
+    """Return first value for fieldname from the list of job steps"""
+    if debug:
+        print('** Debugging output for {} using {} getting first value'.format(name, fieldname))
+        for line in jobstate:
+            print('{}: {}'.format(line['JobID'], line[fieldname]))
+    for line in jobstate:
+        result = line[fieldname]
+        if result != '' and result != None:
+           if debug:
+               print('Returning: {}'.format(result))
+           return result
+    if debug:
+        print('Returning: {}', missing_data)
+    return missing_data
+
+def get_max_int(jobstate, name, fieldname):
+    """Return the maximum value for fieldname from the list of job steps"""
+    if debug:
+        print('** Debugging output for {} using {} getting maximum value'.format(name, fieldname))
+    value = -1
+    for line in jobstate:
+        item = line[fieldname]
+        if debug:
+            print('{}: {}'.format(line['JobID'], item))
+        if item != '':
+           value = max(int(item), value)
+    if value < 0:
+       value = missing_data
+    if debug:
+         print('Returning: {}'.format(value))
+    return value
+
+def get_state(jobstate, name,  fieldname):
+    """Append unique values from fieldname from the list of jobsteps"""
+    if debug:
+        print('** Debugging output for {} using {} appending values'.format(name, fieldname))
+    states = []
+    for line in jobstate:
+        item = line[fieldname]
+        if debug:
+            print('{}: {}'.format(line['JobID'], item))
+        if item != '':
+           if item not in states:
+               states.append(item)
+    if len(states) > 1:
+        # Completed should be the only value, if not remove it
+        if 'COMPLETED' in states:
+            states.remove('COMPLETED')
+        # Remove CANCELLED when TIMEOUT is present
+        if 'CANCELLED' in states and 'TIMEOUT' in states:
+            states.remove('CANCELLED')
+    if len(states) > 0:
+        # Find and adjust 'CANCELLED by' and remove 'CANCELLED' if it is also present
+        found_cancelled_by = False
+        for index in range(len(states)):
+            if 'CANCELLED by' in states[index]:
+                 found_cancelled_by = True
+                 # Replace uid by 'user' or 'operator'
+                 uid = int(states[index][12:])
+                 if uid > min_user_uid:
+                     states[index] = 'CANCELLED by user'
+                 else:
+                     states[index] = 'CANCELLED by operator'
+        if found_cancelled_by and 'CANCELLED' in states:
+            states.remove('CANCELLED')
+        output = ','.join(states)
+    else:
+        output = missing_data
+    if debug:
+        print('Returning: {}'.format(output))
+    return output
+
+def get_min_date(jobstate, name, fieldname):
+    """Get lowest date value for fieldname"""
+    if debug:
+        print('** Debugging output for {} using {} getting lowest value'.format(name, fieldname))
+    value = 'z'
+    for line in jobstate:
+        item = line[fieldname]
+        if debug:
+            print('{}: {}'.format(line['JobID'], item))
+        if item != '':
+           value = min(item, value)
+    if str(value).lower() == 'unknown':
+       value = missing_data
+    if debug:
+        print('Returning: {}'.format(value))
+    return value
+
+def get_max_date(jobstate, name, fieldname):
+    """Get maximum date value for fieldname"""
+    if debug:
+        print('** Debugging output for {} using {} getting maximum value'.format(name, fieldname))
+    value = missing_data
+    for line in jobstate:
+        item = line[fieldname]
+        if debug:
+            print('{}: {}'.format(line['JobID'], item))
+        if item != '':
+           value = date_max(value, item)
+    if str(value).lower() == 'unknown':
+       value = missing_data
+    if debug:
+       print('Returning: {}'.format(value))
+    return value
+
+def get_max_time(jobstate, name, fieldname):
+    """Get maximum time value from fieldname"""
+    if debug:
+        print('** Debugging output for {} using {} getting max time'.format(name, fieldname))
+    value = -1.0
+    data = missing_data
+    for line in jobstate:
+        item = line[fieldname]
+        if item == 'UNLIMITED':
+            if debug:
+               print('Returning: {}'.format(item))
+            return item
+        if debug:
+            print('{}: {}'.format(line['JobID'], item))
+        if item != '' and item != 'INVALID' and timestring_to_seconds(item) > value:
+            value = timestring_to_seconds(item)
+            data = item
+    if debug:
+        print('Returning: {}'.format(data))
+    return data
+
+def get_gpu_tres(jobstate, name, fieldname):
+    """Parse the GPU tres values, searching for *gpu*=value"""
+    if debug:
+        print('** Debugging output for {} using {} getting first value'.format(name, fieldname))
+    for line in jobstate:
+        result = tres_gpu(line[fieldname])
+        if debug:
+            print('{}: {}'.format(line['JobID'], result))
+        if result != '' and result != None:
+            if debug:
+                print('Returning: {}'.format(result))
+            return result
+    if debug:
+        print('Returning: {}'.format(missing_data))
+    return missing_data
+
+def get_max_key(jobstate, name, fieldname, key):
+    """Find the maximum positive value from a list of values in fieldname with 'key=value'"""
+    value = -1.0
+    if debug:
+        print('** Debugging output for {} using {} getting maximum value'.format(name, fieldname))
+    for line in jobstate:
+        item = line[fieldname]
+        if debug:
+            print('{}: {}'.format(line['JobID'], item))
+        current_value = tres_key(key, item)
+        if current_value != None:
+           value = max(value, current_value)
+    if value < 0:
+        value = missing_data
+    if debug:
+        print('Returning: {}'.format(value))
+    return value
+
+def get_max_gpuutil(jobstate, name, fieldname):
+    """Find maximum gpu utilization in fieldname searching for 'gres/gpuutil=value'"""
+    value = get_max_key(jobstate, name, fieldname, 'gres/gpuutil')
+    if value != missing_data:
+       return '{:.0f}%'.format(value)
+    return value
+
+def get_max_gpumem(jobstate, name, fieldname):
+    """Find maximum gpu utilization in fieldname searching for 'gres/gpumem=value'"""
+    return format_bs(get_max_key(jobstate, name, fieldname, 'gres/gpumem'))
+
+def get_max_mem(jobstate, name, fieldname):
+    """Get maximum memory used in fieldname searching for 'mem=value'"""
+    return format_bs(get_max_key(jobstate, name, fieldname, 'mem'))
+
+def get_max_byte(jobstate, name, fieldname):
+    """Get maximum value from the job steps for values in fieldname in byte format"""
+    if debug:
+        print('** Debugging output for {} using {} getting maximum value'.format(name, fieldname))
+    value = -1.0
+    for line in jobstate:
+        item = line[fieldname]
+        if debug:
+            print('{}: {}'.format(line['JobID'], item))
+        value = max(byte_size(item), value)
+    if value < 0:
+        value = missing_data
+    else:
+       value = format_bs(value)
+    if debug:
+        print('Returning: {}'.format(value))
+    return value
+
+def get_max_entry(jobstate, name, fieldname):
+    """Get node, task and or step information from fieldname where the corresponding value field has its highest value"""
+    max_field = fieldname.replace('Node', '')
+    max_field = max_field.replace('Task', '')
+    if debug:
+        print('** Debugging output for {} getting {} for maximum value of {}, including step for Task'.format(name, fieldname, max_field))
+    value = -1.0
+    for line in jobstate:
+        item = line[max_field]
+        entry_new = line[fieldname]
+        step_new = line['JobID'].split('.')[1] if '.' in line['JobID'] else '-'
+        if debug:
+            print('{}: {} {} {}'.format(line['JobID'], item, entry_new, step_new))
+        if byte_size(item) > value:
+            value = byte_size(item)
+            entry = entry_new
+            step = step_new
+    if value < 0:
+        entry = missing_data
+        step = missing_data
+    if 'Task' in fieldname:
+        entry = entry + ',' + step
+    if debug:
+        print('Returning: {}'.format(entry))
+    return entry
+
+def get_tot_key(jobstate, name, fieldname, key):
+    """Sum the values from a list of entries in fieldname with 'key=value'"""
+    total = -1.0
+    if debug:
+        print('** Debugging output for {} using {} adding values'.format(name, fieldname))
+    for line in jobstate:
+        item = line[fieldname]
+        if debug:
+            print('{}: {}'.format(line['JobID'], item))
+        value = tres_key(key, item)
+        if value != None:
+           total = total + value
+    if total < 0:
+        total = missing_data
+    else:
+       total = total + 1.0
+    if debug:
+        print('Returning: {}'.format(total))
+    return total
+
+def get_tot_disk(jobstate, name, fieldname):
+    """Get total disk I/O for all job steps combined for 'fs/disk=value' in fieldname"""
+    return format_bs(get_tot_key(jobstate, name, fieldname, 'fs/disk'))
+
+# Dictionary keys to use for job_data
+# name: name of the item for later use
+# function: function to call for obtaining the value
+# fieldname: fieldname in sacct or sstat job data where the values reside
+# prefer_live: get data from sstat if a job is running
+dict_keys = [
+    'name',              'function',       'fieldname',        'prefer_live']
+
+# List of lists that will be transformed in a dictionary using the keys above
+job_data = [
+    [ 'JobID',            get_first,       'JobID',            True  ],
+    [ 'JobName',          get_first,       'JobName',          False ],
+    [ 'User',             get_first,       'User',             False ],
+    [ 'Account',          get_first,       'Account',          False ],
+    [ 'Partition',        get_first,       'Partition',        False ],
+    [ 'NodeList',         get_first,       'NodeList',         False ],
+    [ 'NNodes',           get_max_int,     'NNodes',           False ],
+    [ 'NCPUs',            get_max_int,     'NCPUs',            False ],
+    [ 'NTasks',           get_max_int,     'NTasks',           True  ],
+    [ 'State',            get_state,       'State',            False ],
+    [ 'Submit',           get_first,       'Submit',           False ],
+    [ 'Start',            get_min_date,    'Start',            False ],
+    [ 'End',              get_max_date,    'End',              False ],
+    [ 'Timelimit',        get_max_time,    'Timelimit',        False ],
+    [ 'Elapsed',          get_max_time,    'Elapsed',          False ],
+    [ 'TotalCPU',         get_max_time,    'TotalCPU',         False ],
+    [ 'CPUTime',          get_max_time,    'CPUTime',          False ],
+    [ 'UserCPU',          get_max_time,    'UserCPU',          False ],
+    [ 'SystemCPU',        get_max_time,    'SystemCPU',        False ],
+    [ 'ReqMem',           get_first,       'ReqMem',           False ],
+    [ 'MaxRSS',           get_max_byte,    'MaxRSS',           True  ],
+    [ 'MaxVMSize',        get_max_byte,    'MaxVMSize',        True  ],
+    [ 'ReqGPUs',          get_gpu_tres,    'ReqTRES',          False ],
+    [ 'AllocGPUs',        get_gpu_tres,    'AllocTRES',        False ],
+    [ 'GPUUtilization',   get_max_gpuutil, 'TRESUsageInMax',   True  ],
+    [ 'GPUMemory',        get_max_gpumem,  'TRESUsageInMax',   True  ],
+    [ 'TotalMem',         get_max_mem,     'TRESUsageInTot',   True  ],
+    [ 'TotalDiskRead',    get_tot_disk,    'TRESUsageInTot',   True  ],
+    [ 'TotalDiskWrite',   get_tot_disk,    'TRESUsageOutTot',  True  ],
+    [ 'MaxDiskRead',      get_max_byte,    'MaxDiskRead',      True  ],
+    [ 'MaxDiskWrite',     get_max_byte,    'MaxDiskWrite',     True  ],
+    [ 'MaxRSSNode',       get_max_entry,   'MaxRSSNode',       True  ],
+    [ 'MaxRSSTask',       get_max_entry,   'MaxRSSTask',       True  ],
+    [ 'MaxVMSizeNode',    get_max_entry,   'MaxVMSizeNode',    True  ],
+    [ 'MaxVMSizeTask',    get_max_entry,   'MaxVMSizeTask',    True  ],
+    [ 'MaxDiskReadNode',  get_max_entry,   'MaxDiskReadNode',  True  ],
+    [ 'MaxDiskReadTask',  get_max_entry,   'MaxDiskReadTask',  True  ],
+    [ 'MaxDiskWriteNode', get_max_entry,   'MaxDiskWriteNode', True  ],
+    [ 'MaxDiskWriteTask', get_max_entry,   'MaxDiskWriteTask', True  ],
+    [ 'Comment',          get_first,       'Comment',          False ],
+]
+
+# Convert list of lists into list of dictionaries.
+job_data = list(map(lambda x: dict(zip(dict_keys, x)), job_data))
+
+# Find all the field names we need information about
+FIELD_NAMES = [ x['fieldname'] for x in job_data]
+# Only keep unique items
+FIELD_NAMES = list(dict.fromkeys(FIELD_NAMES))
+
+# Define the field names for live values
+FIELD_NAMES_LIVE = [ x['fieldname'] for x in job_data if x['prefer_live']]
+# Only keep unique items
+FIELD_NAMES_LIVE = list(dict.fromkeys(FIELD_NAMES_LIVE))
+
+# Define the corresponding format strings
+FORMAT_STR = '--format={}'.format(','.join(FIELD_NAMES))
+FORMAT_STR_LIVE = '--format={}'.format(','.join(FIELD_NAMES_LIVE))
+
+# Dictionary keys for the columns in job_output
+# description: description to use in the output
+# fieldnames: fieldnames that will be shown in the line
+# format: string formatting to use
+# show: show the item by default
+dict_keys = [
+      'description',                      'fieldnames',                         'format',  'show'
+]
+
+# Output lines as a list of lists that will be transformed into a dictionary using the keys above
+job_output = [
+    [ 'Job ID',                           ['JobID'],                            '{}',       True],
+    [ 'Name',                             ['JobName'],                          '{}',       True],
+    [ 'User',                             ['User'],                             '{}',       True],
+    [ 'Account',                          ['Account'],                          '{}',       True],
+    [ 'Partition',                        ['Partition'],                        '{}',       True],
+    [ 'Nodes',                            ['NodeList'],                         '{}',       True],
+    [ 'Number of Nodes',                  ['NNodes'],                           '{}',       True],
+    [ 'Cores',                            ['NCPUs'],                            '{}',       True],
+    [ 'Number of Tasks',                  ['NTasks'],                           '{}',       True],
+    [ 'State',                            ['State', 'reason', 'dependencies'],  '{} {} {}', True],
+    [ 'Submit',                           ['Submit'],                           '{}',       True],
+    [ 'Start',                            ['Start'],                            '{}',       True],
+    [ 'End',                              ['End'],                              '{}',       True],
+    [ 'Reserved walltime',                ['Timelimit'],                        '{}',       True],
+    [ 'Used walltime',                    ['Elapsed'],                          '{}',       True],
+    [ 'Used walltime*CPUs',               ['CPUTime'],                          '{}',       False],
+    [ 'Used CPU time',                    ['TotalCPU','Efficiency'],            '{} {}',    True],
+    [ '% User (Computation)',             ['UserCPU'],                          '{}',       True],
+    [ '% System (I/O)',                   ['SystemCPU'],                        '{}',       True],
+    [ 'Total memory reserved',            ['ReqMem'],                           '{}',       True],
+    [ 'Max Mem (node,task,step)',         ['MaxRSS', 'MaxRSSNode','MaxRSSTask'],                   '{} ({},{})',  False],
+    [ 'MaxVMSize',                        ['MaxVMSize', 'MaxVMSizeNode', 'MaxVMSizeTask'],         '{} ({},{})',  False],
+    [ 'Maximum memory used',              ['TotalMem'],                         '{}',       True],
+    [ 'Requested GPUs',                   ['ReqGPUs'],                          '{}',       False],
+    [ 'Allocated GPUs',                   ['AllocGPUs'],                        '{}',       False],
+    [ 'Max GPU utilization',              ['GPUUtilization'],                   '{}',       False],
+    [ 'Max GPU memory used',              ['GPUMemory'],                        '{}',       False],
+    [ 'Total Disk Read',                  ['TotalDiskRead'],                    '{}',       False],
+    [ 'Total Disk Write',                 ['TotalDiskWrite'],                   '{}',       False],
+    [ 'Max Disk Read (node,task,step)',   ['MaxDiskRead', 'MaxDiskReadNode','MaxDiskReadTask'],    '{} ({},{})',  False],
+    [ 'Max Disk Write (node,task,step)',  ['MaxDiskWrite', 'MaxDiskWriteNode','MaxDiskWriteTask'], '{} ({},{})',  False],
+    [ 'Comment',                          ['Comment'],                          '{}',       False],
+]
+
+# Convert list of lists into list of dictionaries.
+job_output = list(map(lambda x: dict(zip(dict_keys, x)), job_output))
+
+def get_values_sacct(jobid):
+    """Get the job data for jobid from the 'sacct' tool"""
+    field_sep = u'\u2603'
+    sacct_cmd = [
+        'sacct', FORMAT_STR, '--parsable', '--noheader', '--delimiter', field_sep, '-j', jobid
+    ]
+    info = subprocess.Popen(
+        map(lambda s: s.encode('utf-8'), sacct_cmd),
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    sacct_job_data = []
+    for line in info.stdout:
+       sacct_job_data.append(dict(zip(FIELD_NAMES, line.decode('utf-8').strip().split(field_sep))))
+    if len(sacct_job_data) == 0:
+        print("No such job", file=sys.stderr)
+        sys.exit(1)
+    job_status = sacct_job_data[0]['State']
+    return sacct_job_data, job_status
+
+def get_values_sstat(jobid):
+    """Get the job data for jobid from the 'sstat' tool"""
+    sstat_cmd = [
+        'sstat', FORMAT_STR_LIVE, '--parsable', '--noheader', '-a', '-j', jobid
+    ]
+    info = subprocess.Popen(
+        map(lambda s: s.encode('utf-8'), sstat_cmd),
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    sstat_job_data = []
+    for line in info.stdout:
+       sstat_job_data.append(dict(zip(FIELD_NAMES_LIVE, line.decode('utf-8').strip().split('|'))))
+    return sstat_job_data
+
+def format_timings(output_data):
+    """
+    Function to display multiple timings aligning them at - and :
+    and to calculate the job efficiency
+    """
+    elapsed = timestring_to_seconds(output_data['Elapsed'])
+    elapsed_cpu = timestring_to_seconds(output_data['CPUTime'])
+    cputime = timestring_to_seconds(output_data['TotalCPU'])
+    usertime = timestring_to_seconds(output_data['UserCPU'])
+    systemtime = timestring_to_seconds(output_data['SystemCPU'])
+    ncpus = int(output_data['NCPUs'])
+
+    if cputime == 0:
+        output_data['TotalCPU'] = missing_data
+        output_data['Efficiency'] = ''
+        output_data['SystemCPU'] = missing_data
+        output_data['UserCPU'] = missing_data
+    else:
+        output_data['Efficiency'] = '(Efficiency: {:5.2f}%)'.format(100.0 * cputime / (elapsed * ncpus))
+        output_data['UserCPU'] =  '{:5.2f}%'.format(100.0 * usertime / cputime)
+        output_data['SystemCPU'] =  '{:5.2f}%'.format(100.0 * systemtime / cputime)
+    output_data['Timelimit'] =  f_time(output_data['Timelimit'], output_data)
+    output_data['Elapsed'] = f_time(output_data['Elapsed'], output_data)
+    output_data['CPUTime'] = f_time(output_data['CPUTime'], output_data)
+    output_data['TotalCPU'] = f_time(output_data['TotalCPU'], output_data)
+
+def format_gpu(output_data, job_output):
+    """Function to Show GPU information for the GPU partition or when a GPU was requested"""
+    if output_data['ReqGPUs'] != missing_data:
+        for i in range(len(job_output)):
+            if 'GPU' in job_output[i]['description']:
+                job_output[i]['show'] =  True
+
+def get_cpus_node(nodenames):
+    """Determine the number of CPUs of the first node in nodenames"""
+    nodename = nodenames.split(',')[-1]
+    info = subprocess.Popen(['scontrol', 'show', '-o', 'node', nodename], stdout=subprocess.PIPE)
+    num_cpus_match = re.search(r'cpu=(\d+)', info.stdout.read().decode('UTF-8'))
+    if num_cpus_match:
+        return int(num_cpus_match.group(1))
+    else:
+        return 1
+
+def gpu_util_float(utilization):
+    """Return the gpu utilization percentage as a floating point value"""
+    try:
+        gpu_utilization = float(utilization.strip('%'))
+        return gpu_utilization
+    except ValueError:
+        return 0
+
+def get_hints(output_data):
+    """Determine which hints to show based on the job statistics and show these if applicable"""
+    # Don't show hints for jobs that have not yet finished
+    if output_data['End'].lower() == missing_data:
+        return
+
+    cputime = timestring_to_seconds(output_data['TotalCPU'])
+    elapsed = timestring_to_seconds(output_data['Elapsed'])
+
+    # Ignore jobs without or too little time
+    if cputime == 0 or elapsed < MIN_WALLTIME:
+        return
+
+    # Initialize hints as an empty list
+    hints = []
+
+    # Check GPU efficiency
+    if output_data['ReqGPUs'] != missing_data:
+        gpu_utilization = gpu_util_float(output_data['GPUUtilization'])
+        if gpu_utilization < 0.001:
+            hints.append(
+                ["You are running on a GPU node without actually using the GPU, please fix this."]
+            )
+        elif gpu_utilization < 25.0:
+            hints.append(
+                ["The GPU utilization is low, please check if your code can be optimized,",
+                 "or if you can move your input data to fast local storage."]
+           )
+
+    # Check CPU efficiency
+    ncpus = int(output_data['NCPUs'])
+    efficiency = 100 * cputime / (ncpus * elapsed)
+    # Only show efficiency hints when the efficiency is below 75% and the
+    # code is not running on a GPU.
+    if efficiency < 75 and output_data['ReqGPUs'] == missing_data:
+        if ncpus == 1:
+            hints.append(
+                ["The program efficiency is low.",
+                 "Check the file in- and output pattern of your application."]
+            )
+        elif efficiency <= (100.0 / ncpus):
+            hints.append(
+                ["The program efficiency is very low. Your program does not seem to run in",
+                 "parallel. Please check the program documentation to see how to make the",
+                 "program run in parallel.",
+                 "If you can't find information about this, the program will not run in",
+                 "parallel! Stop requesting multiple CPU cores if that is the case."]
+            )
+        else:
+            hints.append(
+                ["The program efficiency is low. Your program is not using the assigned cores",
+                 "effectively. Please check if you are using all the cores you requested.",
+                 "You may also need to check the file in- and output pattern of your program."]
+            )
+
+    # Memory efficiency
+    # Calculate the average number of cores per node used
+    nnodes = int(output_data['NNodes'])
+    cores_per_node = ncpus / nnodes
+    # Find the total number of cores for the node used
+    cores_max_node = get_cpus_node(output_data['MaxRSSNode'])
+    # If we have requested a full node, don't bother reporting not using
+    # the memory because all the memory is available.
+    if cores_per_node < cores_max_node:
+    # Calculate the total amount of memory requested
+        req_memory = byte_size(output_data['ReqMem'])
+        used_memory = byte_size(output_data['TotalMem'])
+    # Check if at least 75% of the memory has been used, or that that less than MIN_MEMORY_CORE
+    # per core has been left unused, or that the request was below MIN_MEMORY
+        if req_memory > 0.01 and used_memory >= 0 and \
+                req_memory > 1024**3 * MIN_MEMORY and \
+                (used_memory / req_memory) < MIN_MEMORY_FRACTION and \
+                (req_memory - used_memory) > (1024**3 * MIN_MEMORY_CORE * ncpus) and \
+                (output_data['ReqGPUs'] == missing_data or req_memory > 1024**3 * MIN_GPU_MEMORY):
+            hints.append(
+                ["You requested much more CPU memory than your program used.",
+                 "Please reduce the requested amount of memory."]
+            )
+
+    # Display the gathered hints
+    if len(hints) > 0:
+        print("Hints and tips      :")
+        hint_number = 1
+        for hint in hints:
+            hint_line = 1
+            for line in hint:
+                if hint_line == 1:
+                    print(" %i) %s" % (hint_number, line))
+                else:
+                    print("    %s" % line)
+                hint_line = hint_line + 1
+            hint_number = hint_number + 1
+        print(" *) For more information on these issues see:")
+        print("    https://wiki.hpc.rug.nl/habrok/additional_information/job_hints")
+
+
+def parse_arguments():
+    """Parse the command line arguments to determine jobid and options"""
+    global debug
+    global long_output
+
+    parser = argparse.ArgumentParser(prog = 'jobinfo',
+                            description = \
+    '''collates job information from the 'sstat', 'sacct' and 'squeue' SLURM commands
+to give a uniform interface for both current and historical jobs.'''
+    )
+
+    parser.add_argument('-d', '--debug', dest='debug', default=False, action='store_true',
+                      help="show extra information about how the data is gathered")
+
+    parser.add_argument('-l', '--long', dest='long_output', default=False, action='store_true',
+                      help="show more information about the job")
+
+    parser.add_argument('jobid', metavar='jobid', help='the jobid to query')
+
+    args = vars(parser.parse_args())
+    debug = args['debug']
+    long_output = args['long_output']
+    return args['jobid']
+
+def main(jobid):
+    """Main function that will display job statistics for the given jobid"""
+    # Retrieve job information fromt the Slurm sacct tool
+    jobstate, job_status = get_values_sacct(jobid)
+
+    # If the job is running sstat will show information about any completed job steps
+    # Fetch this information from sstat
+    if job_status == 'RUNNING':
+        if debug:
+            print('** Getting values from sstat')
+        jobstate_sstat = get_values_sstat(jobid)
+        if debug and jobstate_sstat == []:
+            print('** No data obtained from from sstat')
+    else:
+       jobstate_sstat = []
+
+    # Get all needed values from the job data
+    output_data = {}
+    for job_item in job_data:
+        if job_item['prefer_live'] and jobstate_sstat != []:
+            if debug:
+               print('** Using live value from sstat data')
+            output = job_item['function'](jobstate_sstat, job_item['name'], job_item['fieldname'])
+        else:
+            output = job_item['function'](jobstate, job_item['name'], job_item['fieldname'])
+        output_data[job_item['name']] = output
+
+    # Add information from squeue from jobs that are still pending
+    dependencies = ''
+    reason = ''
+    if job_status == 'PENDING':
+        if debug:
+            print('** Getting values from squeue')
+        info = subprocess.Popen(
+            ['squeue', '--format=%E;%R;%C', '--noheader', '-a', '-j', jobid],
+            stdout=subprocess.PIPE)
+        squeue_data = info.stdout.readline().decode('utf-8').strip().split(";")
+        if len(squeue_data) == 3:
+           dependencies, reason, ncpus = squeue_data
+           output_data['NCPUs'] = ncpus
+           # Don't display (null) as a dependency
+           if dependencies == '(null)':
+               dependencies = ''
+    # Add the additional information to the dictionary
+    output_data['dependencies'] = dependencies
+    output_data['reason'] = reason
+
+    # Calculate efficiency and change user and system time into percentage
+    format_timings(output_data)
+
+    # Check if we want to show GPU information
+    format_gpu(output_data, job_output)
+
+    # Determine field width for description
+    name_format = '{{:{}}}:'.format(max(len(d['description']) for d in job_output))
+
+    # Display the information gathered in the format described by job_output
+    for item in job_output:
+        if item['show'] or long_output:
+           data = [ output_data[x] for x in item['fieldnames'] ]
+           print(name_format.format(item['description']),item['format'].format(*data))
+
+    # Display potential job hints
+    get_hints(output_data)
+
+
+def usage(pipe):
+    """Show program usage information"""
+    usage_msg = \
+    '''jobinfo - collates job information from the 'sstat', 'sacct' and
+'squeue' SLURM commands to give a uniform interface for both current
+and historical jobs.
+
+Usage:
+    jobinfo <job id>
+
+Report problems to hpc@rug.nl'''
+
+    print(usage_msg, file=pipe)
+
+if __name__ == '__main__':
+    # Get job id for which to get job information
+    jobid = parse_arguments()
+    main(jobid)
