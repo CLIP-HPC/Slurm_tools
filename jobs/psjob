@@ -26,7 +26,7 @@ while getopts "c:h" options; do
 			fi
 			if [[ $columns -lt 5 ]] || [[ $columns -gt 1024 ]]
 			then
-				echo Unreasonable number of columns $columns 
+				echo Unreasonable number of columns $columns
 				exit 1
 			fi
 			;;
@@ -59,7 +59,7 @@ jobid=$1
 JOBSTATE="`squeue -h -O State:. -j $jobid`"
 if test "$?" != "0"
 then
-	echo Error inquiring about job $jobid 
+	echo Error inquiring about job $jobid
 	exit 1
 fi
 
@@ -135,24 +135,34 @@ fi
 #   Viewing mounts on a node from outside the job: findmnt -l -o target,source,fstype,propagation
 
 JobContainerType=`scontrol show config | grep JobContainerType | awk '{print $3}'`
-if [[ "$JobContainerType" == "job_container/tmpfs" ]]
+NamespaceType=`scontrol show config | grep NamespaceType | awk '{print $3}'`
+if [[ "$JobContainerType" == "job_container/tmpfs" || "$NamespaceType" == "namespace/tmpfs" ]]
 then
 	echo "$bar"
 	# echo "Slurm job_container temporary scratch spaces:"
-	# grep -i '^BasePath' /etc/slurm/job_container.conf
-	basepath=`grep -i '^BasePath' /etc/slurm/job_container.conf | awk '{split($1,a,"="); print a[2]}'`
+	# Check both standard and configless Slurm locations for job_container.conf
+	if [[ -f /etc/slurm/job_container.conf ]]; then
+		job_container_conf=/etc/slurm/job_container.conf
+	elif [[ -f /var/run/slurm/conf/job_container.conf ]]; then
+		job_container_conf=/var/run/slurm/conf/job_container.conf
+	else
+		echo "ERROR: job_container.conf not found in /etc/slurm/ or /var/run/slurm/conf/"
+		exit 1
+	fi
+	basepath=`grep -i '^BasePath' $job_container_conf | awk '{split($1,a,"="); print a[2]}'`
 	echo "Scratch disk usage for JobID $realjobid:"
 	echo "Node: Usage     Scratch folder"
 	# Sort output on nodenames using "sort -k 1"
-	$CLUSH -w $NODELIST "findmnt -l -o target -t xfs | grep $realjobid | xargs du -sh" | sort -k 1
+	$CLUSH -w $NODELIST "findmnt -l -o target | grep $realjobid | xargs du -sh" | sort -k 1
 	echo
 	echo "Scratch disks on JobID $realjobid compute nodes:"
 	echo "Node:        Size   Used  Avail   Use%  Mounted on"
 	# Sort output on nodenames (key 1)
-	$CLUSH -w $NODELIST "df -Ph $basepath | tail -n+2" | awk '{printf("%-10s %6s %6s %6s %6s  %-20s\n", $1, $3, $4, $5, $6, $7)}' | sort -k 1
+	# Replace %n in basepath with the short hostname of each node
+	$CLUSH -w $NODELIST "node=\$(hostname -s); b=\"$basepath\"; df -Ph \"\${b//%n/\$node}\" | tail -n+2" | awk '{printf("%-10s %6s %6s %6s %6s  %-20s\n", $1, $3, $4, $5, $6, $7)}' | sort -k 1
 fi
 
 echo "$bar"
 
-# $CLUSH -bw $NODELIST "$PS $PSFLAGS \$(scontrol listpids $realjobid | tail -n+3 | awk '{print \$1}') | grep -v ' root    '" 
+# $CLUSH -bw $NODELIST "$PS $PSFLAGS \$(scontrol listpids $realjobid | tail -n+3 | awk '{print \$1}') | grep -v ' root    '"
 # You could also use: $CLUSH -bw@sj:$realjobid ...
