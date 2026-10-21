@@ -346,7 +346,7 @@ function set_qos (job_desc, part_list, submit_uid, log_prefix)
 		qos = default_qos
 	end
 	-- Skip if QOS already contains '_', meaning it has already been formatted
-	if string.find(qos, '_') then
+	if string.find(qos, '_') or is_grid_job then
 		return slurm.SUCCESS
 	end
 	if submit_part == nil then
