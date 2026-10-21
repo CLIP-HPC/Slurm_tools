@@ -58,6 +58,17 @@ highmem = {
 	cores_per_node=32,		-- Cores per node (used to derive minimum memory per CPU)
 }
 
+-- Interactive sessions (OpenOnDemand, salloc, srun --pty)
+-- See docs/adr/0001-interactive-reservations-and-qos.md in CLIP-HPC/clip-cbe-cluster
+interactive = {
+	qos="interactive",		-- QOS used as is, without the "<partition>_" prefix
+	ood_alloc_node="^cbe%-ood%-",	-- Lua pattern matching the OpenOnDemand submit host(s)
+	reservations={			-- partition name -> recurring FLEX reservation
+		c="interactive",
+		g="interactive_gpu",
+	},
+}
+
 --
 -- Define functions to be used
 --
@@ -337,6 +348,16 @@ function check_gpus (job_desc, part_list, submit_uid, log_prefix)
 	return slurm.SUCCESS
 end
 
+-- Return the name of the default partition from part_list (nil if there is none)
+function default_partition (part_list)
+	for name, part in pairs(part_list) do
+		if part.flag_default ~= 0 then
+			return part.name
+		end
+	end
+	return nil
+end
+
 -- Construct and set the final QOS as "<partition>_<qos>"
 function set_qos (job_desc, part_list, submit_uid, log_prefix)
 	local qos = job_desc.qos
@@ -346,23 +367,58 @@ function set_qos (job_desc, part_list, submit_uid, log_prefix)
 		qos = default_qos
 	end
 	-- Skip if QOS already contains '_', meaning it has already been formatted
-	if string.find(qos, '_') or is_grid_job then
+	-- The interactive QOS spans all partitions and has no prefix
+	if string.find(qos, '_') or is_grid_job or qos == interactive.qos then
 		return slurm.SUCCESS
 	end
 	if submit_part == nil then
-      for name, part in pairs(part_list) do
-        if part.flag_default ~= 0 then
-          submit_part = part.name
-		  slurm.log_info("%s: Job from user %s setting default partition value: %s",
-									log_prefix, userinfo, submit_part)
-          break
-        end
-       end
-     end
+		submit_part = default_partition(part_list)
+		slurm.log_info("%s: Job from user %s setting default partition value: %s",
+			log_prefix, userinfo, submit_part)
+	end
 	local result_qos = submit_part .. '_' .. qos
 	job_desc.qos = result_qos
 	job_desc.partition = submit_part
 	slurm.log_info("%s: user %s setting QOS to %s", log_prefix, userinfo, result_qos)
+	return slurm.SUCCESS
+end
+
+-- Interactive sessions: OpenOnDemand jobs, jobs requesting an interactive reservation,
+-- and jobs requesting the interactive QOS all get the interactive QOS plus the
+-- partition's interactive reservation. The reservations are FLEX, so jobs can start
+-- outside the reservation window and outside the reserved resources.
+-- Must run after set_qos, which turns an OpenOnDemand form QOS such as "short" into "c_short".
+function set_interactive (job_desc, part_list, submit_uid, log_prefix)
+	local is_ood = job_desc.alloc_node ~= nil and
+		string.find(job_desc.alloc_node, interactive.ood_alloc_node) ~= nil
+	local in_resv = false
+	if job_desc.reservation ~= nil then
+		for part, resv in pairs(interactive.reservations) do
+			if job_desc.reservation == resv then
+				in_resv = true
+				break
+			end
+		end
+	end
+	if not (is_ood or in_resv or job_desc.qos == interactive.qos) then
+		return slurm.SUCCESS
+	end
+	if job_desc.qos ~= interactive.qos then
+		if job_desc.qos ~= nil and not is_ood then
+			slurm.log_user("NOTICE: QOS %s replaced by %s for interactive sessions",
+				job_desc.qos, interactive.qos)
+		end
+		job_desc.qos = interactive.qos
+	end
+	-- Multi-partition requests such as "c,g" match no entry and get no reservation
+	local part = job_desc.partition or default_partition(part_list)
+	local resv = part and interactive.reservations[part]
+	if job_desc.reservation == nil and resv ~= nil then
+		job_desc.reservation = resv
+	end
+	slurm.log_info("%s: user %s interactive session (ood=%s) partition=%s QOS=%s reservation=%s",
+		log_prefix, userinfo, tostring(is_ood), part or "(default)", job_desc.qos,
+		job_desc.reservation or "(none)")
 	return slurm.SUCCESS
 end
 
@@ -398,7 +454,7 @@ function slurm_job_submit(job_desc, part_list, submit_uid)
 
 	-- Loop over the function list
 	-- We will call these functions in the order listed
-	local functionlist = { check_arg_list, forbid_reserved_name, set_qos,
+	local functionlist = { check_arg_list, forbid_reserved_name, set_qos, set_interactive,
 		check_interactive_job, check_time, check_big_memory, check_memory,
 		forbid_memory_eq_0, check_gpus }
 
