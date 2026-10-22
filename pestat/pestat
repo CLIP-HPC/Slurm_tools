@@ -431,7 +431,7 @@ BEGIN {
 			split (TresAlloc, treslist, ",")
 			for (i in treslist) {
 				# Additional tres-alloc values could be extracted here if desired, for example:
-				#if (index(treslist[i], "cpu=") > 0) {
+				#if (index(treslist[i], "cpu=") > 0) 
 				#	# The "generic" CPU field "cpu="
 				#	GRES = treslist[i] ","
 				if (index(treslist[i], "gres/gpu=") > 0) {
@@ -482,6 +482,7 @@ BEGIN {
 		for (i in jobnodes) {
 			n = jobnodes[i]
 			hostname[n] = n
+			if (EndTime > NodeLastEndTime[n]) NodeLastEndTime[n] = EndTime
 			jobs[n] = jobs[n] sep[n] JobInfo 
 			sep[n] = "| "	# Separating the job list with |
 			# Record the TimeUsedSec for the most recently started job on this node
@@ -608,16 +609,18 @@ BEGIN {
 			statecolor=NORMAL
 		}
 		# Flag unexpected CPU load average on allocated cores
-		if (usedgpus > 0)
+		ideal_load_max = allocated_cores
+		if (usedgpus > 0) {
 			# For GPU nodes assume that 1 (or more) CPU tasks per GPU is ideal
 			ideal_load_min = usedgpus
-		else if (threadspercore == 1)
+			# Max CPU load should be the fraction of GPUs used times total number of cores
+			ideal_load_max = (total_cores * usedgpus) / availgpus
+		} else if (threadspercore == 1)
 			# Single thread per core: Ideal load equals number of physical cores.
 		       	ideal_load_min = allocated_cores
 		else
 			# Multiple threads per CPU core: Load of 1..threadspercore per physical core is OK.
 			ideal_load_min = allocated_cores / threadspercore
-		ideal_load_max = allocated_cores
 		# Calculate if cpuload is outside ideal load bounds, plus some deltas
 		if (cpuload > ideal_load_max + cpuload_delta1 || cpuload < ideal_load_min - cpuload_delta1) {
 			loadflag="*"
@@ -683,6 +686,7 @@ BEGIN {
 		printf("%s%7.2f%1s%s ", loadcolor, cpuload, loadflag, NORMAL)
 		printf("%s%8d %s%8d%1s%s ", memcolor, memory, freememcolor, freemem, memflag, NORMAL)
 		if (printgres == 1) printf("%2d/%-2d ", availgpus, usedgpus)
+		if (printjobendtime == 1 && numjobs[node] > 1) jobs[node] = jobs[node] "| LASTJOB=" NodeLastEndTime[node]
 		printf("%s%s%1s%s", jobcolor, jobs[node], jobflag, NORMAL)
 		printf("\n")
 	}

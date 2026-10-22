@@ -38,7 +38,7 @@ function format_sacct()
 {
 	# echo Called format_sacct with $@
 	# Add -P flag for parseable output with fields separated by "|"
-	sacct -P $@ | awk -F "|" '
+	sacct --parsable2 $@ | awk -F "|" '
 {
 	for (i=1; i<= NF; i++) {
 		column[i][NR] = $i
@@ -74,7 +74,15 @@ function print_job_accounting()
 	if [[ -z "`sacct -nP -o JobID -j $jobid`" ]]
 	then
 		echo
-		echo ERROR: Invalid JobID: $jobid is not found in the Slurm database
+		echo "ERROR: Invalid JobID: $jobid is not found in the Slurm database"
+		exit 1
+	fi
+	# Check the the current user is either root or the job owner
+	jobuser="`sacct -nP -o User --allocations -j $jobid`"
+	currentuser="`id -nu`"
+	if [[ "$currentuser" != "root" && "$currentuser" != "$jobuser" ]]
+	then
+		echo "ERROR: JobID $jobid may only be inquired by its owner: $jobuser"
 		exit 1
 	fi
 	echo
@@ -82,33 +90,61 @@ function print_job_accounting()
 	echo
 	echo "Job parameters for jobid $jobid:"
 	export jobvars="jobid,jobname,user,account,partition,Timelimit"
-	format_sacct -j $jobid -o $jobvars
+	format_sacct --allocations -j $jobid -o $jobvars
 
 	echo
 	echo "Job details information for jobid $jobid:"
-	export jobvars="jobid,Submit,Eligible,Start,elapsed,End,CPUTime,NNodes,NCPUS,ExitCode,nodelist,State,ConsumedEnergyRaw,AllocTRES"
-	format_sacct -j $jobid -o $jobvars
+	export jobvars="jobid,Submit,Eligible,Start,elapsed,End,CPUTime,NNodes,NCPUS,ExitCode,nodelist,State,ConsumedEnergyRaw"
+	format_sacct --allocations -j $jobid -o $jobvars
+
+	# Detect if any GPU resources were allocated
+	alloctres="`sacct -nP -o AllocTRES --allocations -j $jobid`"
+	if [[ -n "`echo $alloctres | grep gres/gpu`" ]]
+	then
+		echo
+		echo "GPU usage details information for jobid $jobid:"
+		echo "-------------------------------------------------"
+		state="`sacct -nP -o State -j $jobid.batch`"
+		echo "Job state is: $state"
+		echo "AllocTRES: $alloctres"
+		gresgpu="`echo $alloctres | awk -F, '{for (i=1; i<= NF; i++) print $i}' | grep 'gres/gpu='`"
+		# Use sstat for running jobs, sacct for completed jobs
+		if [[ "$state" =~ "RUNNING" ]]
+		then
+			gpuutil="`sstat -nP -j $jobid.batch -o TRESUsageInAve | awk -F, '{for (i=1; i<= NF; i++) print $i}' | grep 'gres/gpuutil'`"
+			gpumem="`sstat -nP -j $jobid.batch -o TRESUsageInMax | awk -F, '{for (i=1; i<= NF; i++) print $i}' | grep 'gres/gpumem'`"
+		else
+			gpuutil="`sacct -nP -j $jobid -o TRESUsageInAve | awk -F, '{for (i=1; i<= NF; i++) print $i}' | grep 'gres/gpuutil'`"
+			gpumem="`sacct -nP -j $jobid -o TRESUsageInMax | awk -F, '{for (i=1; i<= NF; i++) print $i}' | grep 'gres/gpumem'`"
+		fi
+		echo "Avg GPU utilization: $gpuutil% ($gresgpu)"
+		echo "Max GPU memory:      $gpumem (MB) ($gresgpu)"
+	fi
 
 	echo
-	export jobvars="SubmitLine"
-	format_sacct -j $jobid -o $jobvars
+	echo "SubmitLine:"
+	echo "-----------"
+	sacct -nP --allocations -j $jobid -o "SubmitLine"
+
+	echo
+	echo "WorkDir:"
+	echo "--------"
+	sacct -nP --allocations -j $jobid -o "WorkDir"
+
+	# Get user fairshare information
+	echo
+	echo "User fairshare information:"
+	echo "---------------------------"
+	jobuser="`sacct -nP --allocations -j $jobid -o user`"
+	sshare -lUm -u $jobuser
 
 	# Print job script if AccountingStoreFlags=job_script was enabled in slurm.conf
 	if [[ -n "`scontrol show config | grep AccountingStoreFlags | grep job_script`" ]]
 	then
 		echo
-		sacct -j $jobid -B
+		sacct --allocations -j $jobid --batch-script
+		echo
 	fi
-
-	echo
-	export jobvars="WorkDir"
-	format_sacct -j $jobid -o $jobvars
-
-	# Get user fairshare information
-	echo
-	export jobuser=`sacct -nP -j $jobid -o user`
-	echo "User fairshare information from the sshare command:"
-	sshare -lUm -u $jobuser
 }
 
 ###########################################################################
@@ -123,7 +159,7 @@ then
 	echo
 	echo Job $jobid is not in the current Slurm queue
 	print_job_accounting
-	exit 1
+	exit 0
 fi
 
 # Check if this jobid can be inquired successfully.
@@ -149,7 +185,9 @@ fi
 # Get required job information from a single squeue command:
 # Note: Some fields may be very long!
 # Alternative: scontrol show job 8079707 | tr -s '[:blank:]' '\n' | awk -F= '{printf("%s=\"%s\"\n", $1, $2)}'
-eval `squeue -hO "UserName,Account,Partition:200,State,NumCPUs,TimeLimit,Reason: ,SubmitTime,Dependency" -j $jobid | awk '{
+# Send squeue output to a temporary file
+tmpfile=`mktemp`
+squeue -hO "UserName,Account,Partition:200,State,NumCPUs,TimeLimit,Reason: ,SubmitTime,Dependency:30" -j $jobid | awk '{
 	print "jobuser=" $1
 	print "jobaccount=" $2
 	print "partition=" $3
@@ -158,8 +196,13 @@ eval `squeue -hO "UserName,Account,Partition:200,State,NumCPUs,TimeLimit,Reason:
 	print "timelimit=" $6
 	print "reason=" $7
 	print "submittime=" $8	# Note: Time %V may modified by SLURM_TIME_FORMAT
-	print "dependency=" "$9"	# Note: Dependency %E may be a null string and must be last
-}'`
+	# Note: Dependency %E may be a null string and must be last
+	# Dependency may contain problem characters () that must be enclosed in ""
+	print "dependency=\"" $9 "\""
+}' > $tmpfile
+source $tmpfile
+rm -f $tmpfile
+
 # Get time limit as a number of minutes
 minutes=`echo $timelimit | awk -F- '
 {
@@ -234,8 +277,7 @@ then
 		$showuserlimits -u $jobuser -A $jobaccount -p $partition -l MaxJobs
 	elif [[ "$reason" = "Dependency" ]]
 	then
-		echo
-		echo "Dependency information: $dependency"
+		echo "   Dependency information: $dependency"
 	fi
 	echo
 fi
@@ -255,10 +297,11 @@ then
 		cat $TMPFILE
 	fi
 fi
-rm -f $TMPFILE
 
 # Print accounting information only when the job is in the Running state
-if [[ "$jobstate" = "Running" ]]
+if [ "$jobstate" = "RUNNING" ]
 then
 	print_job_accounting
 fi
+
+rm -f $TMPFILE
