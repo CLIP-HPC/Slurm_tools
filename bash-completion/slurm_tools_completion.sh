@@ -46,7 +46,7 @@ then
 
 		complete -o nospace -F _slurm_tools_sinfo showpartitions
 		complete -o nospace -F _slurm_tools_sinfo slurmacct
-		complete -o nospace -F _slurm_tools_sinfo jobstats
+		complete -o nospace -F _slurm_tools_sinfo jobacctstats
 
 		complete -o nospace -F _hostlist shownode
 		complete -o nospace -F _hostlist sdrain

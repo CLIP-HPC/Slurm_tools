@@ -6,7 +6,7 @@ pestat=pestat/pestat
 slurm_tools_completion=bash-completion/slurm_tools_completion.sh
 
 usertools=showuserjobs/showuserjobs showuserlimits/showuserlimits
-accountingtools=slurmacct/slurmacct slurmacct/jobstats slurmacct/topreports slurmreportmonth/slurmreportmonth
+accountingtools=slurmacct/slurmacct slurmacct/jobacctstats slurmacct/topreports slurmreportmonth/slurmreportmonth
 
 jobtools=jobs/joblist jobs/psjob jobs/showjob jobs/showjobreasons jobs/jobinfo jobs/jobeff
 job_admintools=jobs/jobnice jobs/jobqos jobs/jobtimelimit jobs/notifybadjob jobs/sbadjobs jobs/schedjobs jobs/sratelimit jobs/warn_maxjobs
