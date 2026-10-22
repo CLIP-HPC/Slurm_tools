@@ -325,6 +325,8 @@ function check_gpus (job_desc, part_list, submit_uid, log_prefix)
 						slurm.log_user(script_error)
 						return slurm.ESLURM_INVALID_GRES
 					end
+				elseif job_desc.tres_per_job ~= nil and string.find(job_desc.tres_per_job, "gpu") then
+					-- --gpus/-G: GPU count for the whole job, no task count needed
 				elseif job_desc.tres_per_node ~= nil or job_desc.tres_per_socket ~= nil or job_desc.tres_per_task ~= nil then
 					-- Alternative use of gpus in newer versions of slurm
 					if job_desc.num_tasks == slurm.NO_VAL then
