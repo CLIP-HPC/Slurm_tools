@@ -37,6 +37,7 @@ then
 
 		complete -o nospace -F _slurm_tools_squeue pestat
 		complete -o nospace -F _slurm_tools_squeue showpower
+		complete -o nospace -F _slurm_tools_squeue showpower_nvidia
 		complete -o nospace -F _slurm_tools_squeue showuserjobs
 		complete -o nospace -F _slurm_tools_squeue jobnice
 		complete -o nospace -F _slurm_tools_squeue showuserlimits
@@ -52,6 +53,7 @@ then
 		complete -o nospace -F _hostlist sdrain
 		complete -o nospace -F _hostlist sresume
 		complete -o nospace -F _hostlist sreboot
+		complete -o nospace -F _hostlist reserve_on_idle
 		complete -o nospace -F _hostlist psnode
 		complete -o nospace -F _hostlist spowerdown
 		complete -o nospace -F _hostlist spowerup
