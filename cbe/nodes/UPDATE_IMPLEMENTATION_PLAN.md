@@ -1,6 +1,6 @@
 # Automated node updates on CBE.next: implementation plan
 
-Status: draft, 2026-10-23. Owner: CBE systems engineering.
+Status: draft, 2026-10-23 (revised: vendor-based firmware updates, PR 3 dropped). Owner: CBE systems engineering.
 
 This plan adapts upstream's reboot-driven update mechanism
 ([nodes/update_down_node.sh](../../nodes/update_down_node.sh) and its helper scripts)
@@ -34,7 +34,8 @@ to CBE.next. It stays as close to upstream as possible.
    `nodes/update_software.sh` or `nodes/update_firmware.sh`. Upstream changes those often for DTU's
    hardware, and editing them would cause merge conflicts.
 3. **Every version is decided centrally.** Packages come from a Satellite content-view version,
-   and firmware from a fixed catalog or fixed files per model. A node can never pull an unreviewed version.
+   and firmware from a fixed, reviewed vendor repository (Dell DSU catalog, Lenovo OneCLI folder).
+   A node can never pull an unreviewed version.
 4. **Fail safe.** Any error leaves the node `DOWN` with a clear log entry and a mail to root.
    Nothing is retried in a loop.
 
@@ -46,7 +47,7 @@ nodes/update_software.sh           # upstream example, unused by us
 nodes/update_firmware.sh           # upstream example, unused by us
 cbe/nodes/update_down_node.conf    # our settings -> /etc/sysconfig/update_down_node
 cbe/nodes/update_software.sh       # Satellite-based software update -> $SCRIPTDIR
-cbe/nodes/update_firmware.sh       # Dell/Lenovo firmware for our models -> $SCRIPTDIR
+cbe/nodes/update_firmware.sh       # Dell/Lenovo firmware via DSU/OneCLI -> $SCRIPTDIR
 cbe/nodes/README.md                # admin runbook
 cbe/nodes/UPDATE_IMPLEMENTATION_PLAN.md   # this file
 ```
@@ -58,8 +59,9 @@ Send them as two pull requests to `OleHolmNielsen/Slurm_tools`.
 
 ### PR 1: configuration and OS detection
 
-**1a. Set `RPMDIR` from the detected OS version.** Replace the `el8`/`el9` if-chain in the
-`CONFIGURE` section with:
+**1a. Set `RPMDIR` from the detected OS version.** This is a blocker for us: the `el8`/`el9`
+if-chain in the `CONFIGURE` section ends in `exit 1` for any other platform, so the unmodified
+script does nothing on RHEL 10. Replace the if-chain with:
 
 ```bash
 # Platform-specific package directory, e.g. RPMS8, RPMS9, RPMS10.
@@ -68,7 +70,8 @@ RPMDIR=${RPMDIR-$PACKAGEDIR/RPMS$osversion}
 ```
 
 `osversion` is already calculated from `CPE_NAME` but is never used. On RHEL 10.2,
-`cpe:/o:redhat:enterprise_linux:10.2` gives `10` (checked).
+`cpe:/o:redhat:enterprise_linux:10.2` gives `10` (checked). EL8 and EL9 keep their current
+`RPMS8`/`RPMS9` folders.
 
 **1b. Optional site config file.** At the end of the `CONFIGURE` section add:
 
@@ -124,12 +127,6 @@ Remove the attempt file just before the final `scontrol reboot nextstate=resume`
 continue to the final reboot. Upstream's helpers currently use `exit 1`, which already stops the
 script, so this is only a documentation note in the script and README.
 
-### PR 3 (optional): split out the firmware functions
-
-Move `dell_update`, `lenovo_update` and `lenovo_mellanox_update` from `nodes/update_firmware.sh` into
-`nodes/update_firmware_functions.sh`, and source that file from `update_firmware.sh`. We could then
-source upstream's functions directly instead of copying them.
-
 **If upstream declines** any of these, apply them as separate commits on `cbe` named
 `update_down_node: <change>`. That makes them easy to spot and re-apply after each merge.
 
@@ -144,6 +141,7 @@ SCRIPTDIR=$PACKAGEDIR/script-dir
 RPMDIR=""                                  # all packages come from Satellite
 UPDATE_REASON=UPDATE                       # matches "sreboot -d -r UPDATE"
 MAX_ATTEMPTS=2
+FIRMWARE_BASELINE=<TBD, e.g. 2026-11>      # folder under $PACKAGEDIR/{Dell,Lenovo}/
 ```
 
 ### `cbe/nodes/update_software.sh`
@@ -162,23 +160,31 @@ therefore get the same package set.
 
 ### `cbe/nodes/update_firmware.sh`
 
-Same structure as upstream: helper functions, then `dmidecode` detection, then one block per model.
+Unlike upstream, this script has **no per-model blocks**. Upstream copies individual firmware files
+per model into `$PACKAGEDIR/<Vendor>/<model>/` and needs one `if [ "$product" == ... ]` block per model.
+DSU and OneCLI instead match a vendor repository against the local system themselves and apply only
+the packages that fit. We therefore branch on the **manufacturer** only, and a new model needs no
+script change. Upstream's `dell_update`/`lenovo_update` functions are not used.
 
-- **Functions:** source `nodes/update_firmware_functions.sh` if PR 3 is merged. Otherwise copy
-  `dell_update`, `lenovo_update` and `lenovo_mellanox_update` unchanged from upstream, with a comment
-  naming the upstream commit they came from.
 - **Tools** come from Satellite custom products, installed with `dnf` (no files on the shared folder):
   - Dell: `dell-system-update` (DSU), `srvadmin-idracadm`
   - Lenovo: `lnvgy_utl_lxcer_onecli`
-- **Dell:** run DSU against a **fixed catalog** kept at `$PACKAGEDIR/Dell/catalog/<baseline>/Catalog.xml`:
+- **Baseline:** `FIRMWARE_BASELINE=<name>` is set in the site config. Each vendor has one folder per
+  baseline: `$PACKAGEDIR/{Dell,Lenovo}/<baseline>/`. Changing the baseline means publishing a new folder
+  and changing that one variable. Old folders stay for rollback.
+- **Detection:** `manufacturer="$(dmidecode -s system-manufacturer)"`.
+- **Dell:** run DSU against the fixed catalog in `$PACKAGEDIR/Dell/<baseline>/` (contains `Catalog.xml`):
   `dsu --non-interactive --apply-upgrades-only --source-type=REPOSITORY --source-location=<baseline dir>`.
-  Changing the firmware baseline then means publishing a new catalog folder and pointing the config
-  at it. Fall back to `dell_update <model> <file>.BIN` for single components DSU does not cover.
-- **Lenovo:** `lenovo_update <model> <component> <file>` with firmware files in
-  `$PACKAGEDIR/Lenovo/<model>/<component>/`, following upstream's layout.
-- **Model blocks:** one `if [ "$product" == "..." ]` block per model in our inventory
-  (open question 1). Unknown models log a warning and skip firmware updates. They do **not** fail,
-  so a new model still gets its software updates.
+- **Lenovo:** run OneCLI against the fixed repository folder in `$PACKAGEDIR/Lenovo/<baseline>/`:
+  `onecli update flash --dir <baseline dir> --scope latest --nolog` (exact options checked during
+  testing). OneCLI picks the packages that match the node's machine type.
+- **Other manufacturers:** log a warning and skip firmware updates. This does **not** fail, so the
+  node still gets its software updates.
+- **Exit codes:** treat the documented "no updates needed" and "reboot required" exit codes of
+  DSU and OneCLI as success. Any other code stops with an error, so the node stays `DOWN`.
+- **Exceptions:** components that DSU/OneCLI do not cover (for example some NVIDIA/Mellanox adapters,
+  or the B200 HGX baseboard, see open question 4) are the only place a model-specific block may be
+  needed. They are added only when we find such a component.
 - Log firmware versions before and after (`racadm getversion` / `onecli inventory`) so we can check
   the baseline was applied.
 
@@ -191,7 +197,7 @@ Same structure as upstream: helper functions, then `dmidecode` detection, then o
 | `@reboot root /root/update_down_node.sh` | `/etc/cron.d/update_down_node` | Ansible role |
 | Packages needed: `dmidecode`, `s-nail`, `NetworkManager` | compute nodes | Ansible role / Satellite host group |
 | `cbe/nodes/update_software.sh`, `cbe/nodes/update_firmware.sh` | `$SCRIPTDIR` | Ansible play run on release |
-| Firmware catalogs and files | `$PACKAGEDIR/{Dell,Lenovo}/...` | manual, reviewed by a second admin |
+| Firmware repositories | `$PACKAGEDIR/{Dell,Lenovo}/<baseline>/` | built with Dell Repository Manager / `onecli update acquire` for the models in our inventory, reviewed by a second admin |
 
 Security requirements:
 
@@ -202,7 +208,7 @@ Security requirements:
 
 ## Phase 4: testing
 
-On one node per hardware model, in a dedicated test reservation:
+On one node per hardware model (from the inventory), in a dedicated test reservation:
 
 | # | Test | Expected result |
 |---|---|---|
@@ -214,13 +220,13 @@ On one node per hardware model, in a dedicated test reservation:
 | T6 | `dnf` fails (e.g. Satellite unreachable) | Error in `update.log`, node stays `DOWN`, no final reboot. |
 | T7 | `slurmd` disabled before the end of the update | At most `MAX_ATTEMPTS` reboots, then mail and node stays `DOWN`. |
 | T8 | Shared-partition node with jobs, after `reserve_on_idle` | Backfill only starts jobs that end before the reservation. Reservation is deleted after the update. |
-| T9 | Unknown hardware model | Software updated, firmware skipped with a warning. |
+| T9 | Unknown manufacturer (or model missing from the repository) | Software updated. Firmware skipped with a warning (unknown manufacturer) or DSU/OneCLI reports nothing to apply. Node returns to service. |
 
 ## Phase 5: running an update round
 
 1. Publish and promote the new content-view version to the compute nodes' lifecycle environment.
-2. If needed, publish the new Dell catalog or Lenovo firmware files and update `update_firmware.sh`.
-   Deploy it to `$SCRIPTDIR`.
+2. If needed, publish a new firmware baseline folder for Dell and/or Lenovo and set
+   `FIRMWARE_BASELINE` in the site config (deployed by Ansible).
 3. For shared partitions: `reserve_on_idle <nodes>`.
 4. `sreboot -d -r UPDATE <nodes>`, in batches (e.g. one rack or ≤10 % of a partition at a time).
 5. Monitor with `sinfo -R` and `sinfo -t down`. Nodes still `DOWN` with a reason other than `UPDATE`
@@ -234,8 +240,8 @@ This runbook goes into `cbe/nodes/README.md`.
 - After each merge, run `git diff upstream/master cbe -- nodes/update_down_node.sh`. Once phase 1
   is accepted upstream it should be empty. Otherwise it should contain only our separate
   `update_down_node:` commits.
-- If upstream changes the helper functions (`dell_update`, `lenovo_update`), copy the changes into
-  `cbe/nodes/update_firmware.sh` (only needed if PR 3 was not accepted).
+- Upstream changes to `nodes/update_software.sh` and `nodes/update_firmware.sh` do not affect us,
+  because we use our own helpers and do not copy upstream's functions.
 
 ## Work breakdown
 
@@ -243,18 +249,19 @@ This runbook goes into `cbe/nodes/README.md`.
 |---|---|---|
 | 1 | Collect the hardware model inventory (read-only `dmidecode` via `clush`) | none |
 | 2 | Decide the `PACKAGEDIR` location and the lifecycle environment | none |
-| 3 | Prepare and submit upstream PR 1 and PR 2 (and optionally PR 3) | none |
+| 3 | Prepare and submit upstream PR 1 and PR 2 | none |
 | 4 | Add Satellite custom products for DSU, idracadm and OneCLI | none |
-| 5 | Write `cbe/nodes/update_down_node.conf`, `update_software.sh`, `update_firmware.sh` | 1, 2 |
-| 6 | Ansible role for deployment | 2, 5 |
-| 7 | Tests T1–T9 | 4, 5, 6 |
-| 8 | Write the `cbe/nodes/README.md` runbook | 7 |
-| 9 | First production round on one partition | 8 |
+| 5 | Write `cbe/nodes/update_down_node.conf`, `update_software.sh`, `update_firmware.sh` | 2 |
+| 6 | Build the first Dell and Lenovo firmware baseline repositories | 1, 2 |
+| 7 | Ansible role for deployment | 2, 5 |
+| 8 | Tests T1–T9 | 1, 4, 5, 6, 7 |
+| 9 | Write the `cbe/nodes/README.md` runbook | 8 |
+| 10 | First production round on one partition | 9 |
 
 ## Open questions
 
-1. **Hardware models in use** (`dmidecode -s system-product-name` per node group).
-   This decides the firmware blocks.
+1. **Hardware models in use** (`dmidecode -s system-product-name` per node group). The scripts do not
+   depend on it. It decides which models the firmware repositories must cover and which nodes we test on.
 2. **Location of `PACKAGEDIR`/`SCRIPTDIR`**: which file system is mounted on all compute nodes at boot
    and can be restricted to root/admins?
 3. **Lifecycle environment** for compute nodes, and whether "promote, then reboot" fits the existing
