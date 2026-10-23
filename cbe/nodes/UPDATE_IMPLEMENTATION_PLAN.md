@@ -1,271 +1,198 @@
 # Automated node updates on CBE.next: implementation plan
 
-Status: draft, 2026-10-23 (revised: vendor-based firmware updates, PR 3 dropped). Owner: CBE systems engineering.
+Status: draft, revised 2026-10-23. Owner: CBE systems engineering.
+Tracking issue: [CLIP-HPC/clip-cbe-cluster#89](https://github.com/CLIP-HPC/clip-cbe-cluster/issues/89).
 
-This plan adapts upstream's reboot-driven update mechanism
-([nodes/update_down_node.sh](../../nodes/update_down_node.sh) and its helper scripts)
-to CBE.next. It stays as close to upstream as possible.
+## Decision
 
-## Scope
+We build our own implementation for CBE.next and **do not reuse** upstream's
+[nodes/update_down_node.sh](../../nodes/update_down_node.sh) or its helper scripts. Upstream remains the
+model for the overall idea: a reboot triggered through Slurm leaves the node `DOWN`, and an update runs
+at boot before the node goes back into service. The code is written for our environment only:
 
 - **OS:** RHEL 10 only.
-- **Packages:** from Red Hat Satellite (`satellite.vbc.ac.at`) content views and lifecycle environments.
-  No local RPM folders.
-- **Firmware:** Dell PowerEdge and Lenovo ThinkSystem servers (BMC, BIOS/UEFI, network adapters).
-  NVIDIA GPU firmware is out of scope for the first version (see [Open questions](#open-questions)).
-- **Slurm:** 26.05 (`Exclusive=` partition flag, which `sreboot` already uses).
+- **Packages:** Red Hat Satellite (`satellite.vbc.ac.at`) content views and lifecycle environments. No local RPM folders.
+- **Firmware:** Dell PowerEdge (DSU) and Lenovo ThinkSystem (OneCLI). NVIDIA GPU/HGX firmware is out of
+  scope for the first version (see [Open questions](#open-questions)).
+- **Slurm:** 26.05.
+- **Deployment:** an Ansible role in [CLIP-HPC/clip-cbe-cluster](https://github.com/CLIP-HPC/clip-cbe-cluster).
 
-## How the mechanism works (summary)
+The code lives in clip-cbe-cluster, not in Slurm_tools. We stay on Slurm_tools' generic admin commands
+`sreboot` and `reserve_on_idle` to trigger updates, because they are only wrappers around `scontrol`.
+No upstream pull requests are needed.
 
-1. An admin runs `reserve_on_idle <nodes>` (shared partitions only), then `sreboot -d -r UPDATE <nodes>`.
-2. Slurm reboots each node once it is idle and keeps it `DOWN`.
-3. At boot, `update_down_node.sh` runs from cron. It waits for `slurmd`, reads the node's
-   `State`, `NextState` and `Reason`, and updates only if the node is `DOWN` and the reboot was not
-   unexpected.
-4. It sources `update_software.sh` and `update_firmware.sh` from the shared `$SCRIPTDIR`, then runs
-   `scontrol reboot nextstate=resume reason=Update_done <node>`.
-5. On the second boot it sees `NextState=resume`, exits, and Slurm returns the node to service.
+## What we keep from upstream, and what we change
 
-## Design principles
+| Upstream (`update_down_node.sh`) | CBE.next |
+|---|---|
+| `@reboot` cron job | systemd oneshot unit `cbe-node-update.service`, ordered after `slurmd`, the network and the mounts it needs |
+| Updates every `DOWN` node that did not reboot unexpectedly | Updates only when `Reason` is exactly `UPDATE` or starts with `UPDATE:`. A node set `DOWN` for a hardware fault is never updated. |
+| Parses `scontrol show node` with `grep`/`awk` | Parses `scontrol --json show node` with `jq` |
+| At boot, copies helper scripts from a shared folder and runs them as root | Script deployed by Ansible from git. Only firmware repositories are on shared storage. |
+| `RPMDIR` per EL version, local RPM folders | `dnf distro-sync` against the Satellite content view assigned to the node |
+| One firmware block per hardware model with individual files | Branches on the manufacturer only. DSU/OneCLI pick matching packages from a fixed baseline repository. |
+| Errors: log file, sometimes mail. A missing `slurmd` can cause reboot loops. | Errors set `Reason="UPDATE_FAILED: <step>"`. The node stays `DOWN`, is visible in `sinfo -R` and is never retried automatically. |
+| Logs only in `/root/*.log` | journald (`journalctl -u cbe-node-update`), shipped to Loki like other system logs |
 
-1. **Leave `nodes/update_down_node.sh` as upstream's file.** Send general improvements upstream.
-   Keep anything upstream rejects as small, separate commits on `cbe`.
-2. **Put everything specific to our site in new files under `cbe/nodes/`.** Never edit upstream's
-   `nodes/update_software.sh` or `nodes/update_firmware.sh`. Upstream changes those often for DTU's
-   hardware, and editing them would cause merge conflicts.
-3. **Every version is decided centrally.** Packages come from a Satellite content-view version,
-   and firmware from a fixed, reviewed vendor repository (Dell DSU catalog, Lenovo OneCLI folder).
-   A node can never pull an unreviewed version.
-4. **Fail safe.** Any error leaves the node `DOWN` with a clear log entry and a mail to root.
-   Nothing is retried in a loop.
+## How it works
 
-## Target layout
+1. **Trigger.** An admin promotes the content view (and firmware baseline, if any), then runs:
+   - for shared partitions: `reserve_on_idle <nodes>`
+   - `sreboot -d -r UPDATE <nodes>` (equivalent to `scontrol reboot ASAP nextstate=down reason=UPDATE <nodes>`).
+     A free-text suffix is allowed, e.g. `-r "UPDATE: CV 14.0"`.
+2. **First boot.** Slurm reboots each node once it is idle and keeps it `DOWN` with `Reason=UPDATE`.
+   `cbe-node-update.service` starts after `slurmd` and checks the node with `scontrol --json show node`:
+   - Not `DOWN`, or `Reason` does not match `^UPDATE(:|$)` → log "nothing to do", exit 0.
+   - Matches → set `Reason="UPDATE: running"` and continue.
+3. **Software update** (see below). On failure: `Reason="UPDATE_FAILED: software"`, exit.
+4. **Firmware update** (see below). On failure: `Reason="UPDATE_FAILED: firmware"`, exit.
+5. **Checks** that the node can run jobs after the next boot: the kernel module for the NVIDIA driver
+   exists for the new default kernel (GPU nodes), and `slurmd` is running. On failure:
+   `Reason="UPDATE_FAILED: checks"`, exit.
+6. **Finish.** Delete the reservation `update-<node>` if it exists (created by `reserve_on_idle`), then
+   `scontrol reboot nextstate=resume reason=UPDATE_DONE <node>`.
+7. **Second boot.** The service sees `Reason=UPDATE_DONE`, which does not match, and exits. Slurm returns
+   the node to service.
 
+Because every failure changes `Reason` to `UPDATE_FAILED: ...`, which does not match the trigger, a node
+that failed is never updated again on its own and cannot get into a reboot loop. A node that loses power
+during an update still has `Reason="UPDATE: running"`, so the next boot runs the update again. Both
+updates are safe to repeat. An attempt counter in `/var/lib/cbe-node-update/` (max 2) is a second safety net.
+
+## Components
+
+All in clip-cbe-cluster, as a new role `ansible/roles/node_update` (name to be confirmed).
+
+### `cbe-node-update` (script, `/usr/local/sbin/cbe-node-update`)
+
+Bash with `set -euo pipefail`, one function per step, and a trap that sets `UPDATE_FAILED: <step>` on
+any error. It reads its settings from `/etc/sysconfig/cbe-node-update`. The Slurm node name is
+`hostname -s` unless `NODENAME` is set in the config. `--dry-run` runs the checks and lists pending
+updates (`dnf check-update`, `dsu --preview`, `onecli update compare`) without changing anything.
+
+### Software update
+
+1. `subscription-manager refresh` and log the content view and lifecycle environment (`subscription-manager identity`).
+2. `dnf clean all && dnf -y distro-sync`. `distro-sync` makes the node match the content view exactly,
+   so promoting an older content-view version also rolls nodes back.
+3. Log the versions afterwards: `kernel`, `slurm*`, NVIDIA driver and kmod packages, `rdma-core`.
+
+Version control is in Satellite: a content-view version is promoted to the compute nodes' lifecycle
+environment **before** the update round, so all nodes in a round get the same packages.
+
+### Firmware update
+
+- **Detection:** `dmidecode -s system-manufacturer` → Dell, Lenovo, or other.
+- **Baseline:** `FIRMWARE_BASELINE=<name>` in the config. Each vendor has one folder per baseline in
+  `$FIRMWARE_REPO/{Dell,Lenovo}/<baseline>/`. Changing the baseline means publishing a new folder and
+  changing that variable through Ansible. Old folders stay for rollback.
+- **Dell:** `dsu --non-interactive --apply-upgrades-only --source-type=REPOSITORY --source-location=<baseline dir>`
+  (the folder has a `Catalog.xml` from Dell Repository Manager).
+- **Lenovo:** `onecli update flash --dir <baseline dir> --scope latest --nolog` (folder filled with
+  `onecli update acquire`). Exact options are confirmed in testing.
+- **Other manufacturers:** log a warning and skip firmware. This is not an error.
+- **Exit codes:** the documented "nothing to update" and "reboot required" codes of DSU and OneCLI count
+  as success. Any other code is a failure.
+- Log firmware versions before and after (`racadm getversion` / `onecli inventory`).
+- No per-model logic. A model-specific step is added only if we find a component DSU/OneCLI does not cover.
+
+### systemd unit `cbe-node-update.service`
+
+```ini
+[Unit]
+Description=Update this node if Slurm rebooted it for an update
+Wants=network-online.target slurmd.service
+After=network-online.target slurmd.service remote-fs.target
+RequiresMountsFor=<FIRMWARE_REPO>
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cbe-node-update
+TimeoutStartSec=2h
+
+[Install]
+WantedBy=multi-user.target
 ```
-nodes/update_down_node.sh          # upstream, unmodified (after phase 1 is merged)
-nodes/update_software.sh           # upstream example, unused by us
-nodes/update_firmware.sh           # upstream example, unused by us
-cbe/nodes/update_down_node.conf    # our settings -> /etc/sysconfig/update_down_node
-cbe/nodes/update_software.sh       # Satellite-based software update -> $SCRIPTDIR
-cbe/nodes/update_firmware.sh       # Dell/Lenovo firmware via DSU/OneCLI -> $SCRIPTDIR
-cbe/nodes/README.md                # admin runbook
-cbe/nodes/UPDATE_IMPLEMENTATION_PLAN.md   # this file
-```
 
-## Phase 1: general improvements to `update_down_node.sh` (offered upstream)
-
-Each change is small, can be switched off, and keeps upstream's current behaviour by default.
-Send them as two pull requests to `OleHolmNielsen/Slurm_tools`.
-
-### PR 1: configuration and OS detection
-
-**1a. Set `RPMDIR` from the detected OS version.** This is a blocker for us: the `el8`/`el9`
-if-chain in the `CONFIGURE` section ends in `exit 1` for any other platform, so the unmodified
-script does nothing on RHEL 10. Replace the if-chain with:
+### Config `/etc/sysconfig/cbe-node-update` (Ansible template)
 
 ```bash
-# Platform-specific package directory, e.g. RPMS8, RPMS9, RPMS10.
-# Set RPMDIR="" in the site config to skip local RPM packages entirely.
-RPMDIR=${RPMDIR-$PACKAGEDIR/RPMS$osversion}
-```
-
-`osversion` is already calculated from `CPE_NAME` but is never used. On RHEL 10.2,
-`cpe:/o:redhat:enterprise_linux:10.2` gives `10` (checked). EL8 and EL9 keep their current
-`RPMS8`/`RPMS9` folders.
-
-**1b. Optional site config file.** At the end of the `CONFIGURE` section add:
-
-```bash
-# Site-specific overrides of the variables above
-SITE_CONFIG=/etc/sysconfig/update_down_node
-[[ -r $SITE_CONFIG ]] && source $SITE_CONFIG
-```
-
-This lets sites set `PACKAGEDIR`, `SCRIPTDIR`, `RPMDIR`, `update_software` and `update_firmware`
-without editing the script.
-
-**1c. Makefile fix.** `slurmacct/jobstats` → `slurmacct/jobacctstats` (already fixed on `cbe` in `371719f`).
-
-### PR 2: safety checks
-
-**2a. Optional `UPDATE_REASON`.** Today, rebooting *any* `DOWN` node triggers an update and then
-brings the node back into service, including a node an admin marked down because of a hardware fault.
-Add an optional check after the "unexpectedly rebooted" check:
-
-```bash
-# CONFIGURE: If set, only update nodes whose Reason starts with this string,
-# for example as set by "sreboot -d -r UPDATE <nodelist>"
-UPDATE_REASON=""
-...
-if [[ -n "$UPDATE_REASON" && ! "$reason" =~ ^[[:space:]]*Reason=$UPDATE_REASON ]]
-then
-	echo "NOTICE: Reason does not start with $UPDATE_REASON, no updates will be performed" >> $LOG_FILE0
-	exit 0
-fi
-```
-
-**2b. Protection against reboot loops.** If `slurmd` is not running after the updates, the
-script runs `shutdown -r now` while the node is still `DOWN` with no `NextState`. Every boot then
-repeats the update. Add an attempt counter:
-
-```bash
-ATTEMPT_FILE=/root/update_down_node.attempts
-MAX_ATTEMPTS=${MAX_ATTEMPTS:-2}
-attempts=$(( $(cat $ATTEMPT_FILE 2>/dev/null || echo 0) + 1 ))
-if [[ $attempts -gt $MAX_ATTEMPTS ]]
-then
-	echo "ERROR: $attempts update attempts, giving up. Node stays DOWN." >> $LOG_FILE0
-	echo "Update of $shortname failed $MAX_ATTEMPTS times" | mail -s "Script $0" root
-	exit 0
-fi
-echo $attempts > $ATTEMPT_FILE
-```
-
-Remove the attempt file just before the final `scontrol reboot nextstate=resume`.
-
-**2c. Stop on helper script errors.** If the sourced helper scripts `return 1`, the script should not
-continue to the final reboot. Upstream's helpers currently use `exit 1`, which already stops the
-script, so this is only a documentation note in the script and README.
-
-**If upstream declines** any of these, apply them as separate commits on `cbe` named
-`update_down_node: <change>`. That makes them easy to spot and re-apply after each merge.
-
-## Phase 2: our helper scripts (`cbe/nodes/`)
-
-### `cbe/nodes/update_down_node.conf`
-
-```bash
-# CBE.next settings for update_down_node.sh, installed as /etc/sysconfig/update_down_node
-PACKAGEDIR=/<TBD shared admin path>        # see open question 2
-SCRIPTDIR=$PACKAGEDIR/script-dir
-RPMDIR=""                                  # all packages come from Satellite
-UPDATE_REASON=UPDATE                       # matches "sreboot -d -r UPDATE"
+FIRMWARE_REPO=/<TBD shared admin path>     # open question 2
+FIRMWARE_BASELINE=<TBD, e.g. 2026-11>
 MAX_ATTEMPTS=2
-FIRMWARE_BASELINE=<TBD, e.g. 2026-11>      # folder under $PACKAGEDIR/{Dell,Lenovo}/
 ```
 
-### `cbe/nodes/update_software.sh`
+### Ansible role tasks
 
-Sourced by `update_down_node.sh`. Output goes to `/root/update.log`.
+- Install the script, config, systemd unit; enable the unit.
+- Install `jq`, `dmidecode`; vendor tools by `ansible_system_vendor` from Satellite custom products:
+  Dell `dell-system-update` + `srvadmin-idracadm`, Lenovo `lnvgy_utl_lxcer_onecli`.
+- Bump the pinned Slurm_tools version on `control` (currently `v1.0.1` in `ansible/slurm.yml`) and run
+  `make install_admintools`, so `sreboot` and `reserve_on_idle` are on the admin `PATH`.
+- Lint with the repo's existing `ansible-lint`/pre-commit setup. Add a goss check that the unit is enabled.
 
-1. `subscription-manager refresh`. If it fails, stop with an error.
-2. Log the Satellite content-view environment and enabled repositories (`subscription-manager identity`, `dnf repolist`).
-3. `dnf clean all && dnf -y update`. **Stop with an error if `dnf` fails**, so the node stays `DOWN`.
-4. Log versions after the update: `rpm -q kernel slurm slurm-slurmd nvidia-driver` (whichever are installed).
-5. Leave out upstream's `LOCALPACKAGELIST` and the deletion of AlmaLinux/Rocky repo files. Neither applies to us.
+### Security
 
-Version control happens in Satellite: a content-view version is promoted to the compute nodes'
-lifecycle environment **before** the update is triggered. All nodes updated in one round
-therefore get the same package set.
+- The firmware repository is on storage writable **only** by root/admins, because its contents are
+  flashed onto every node. New baselines are reviewed by a second admin.
+- The script itself is not loaded from shared storage at boot. It only changes through git and Ansible.
 
-### `cbe/nodes/update_firmware.sh`
+## Testing
 
-Unlike upstream, this script has **no per-model blocks**. Upstream copies individual firmware files
-per model into `$PACKAGEDIR/<Vendor>/<model>/` and needs one `if [ "$product" == ... ]` block per model.
-DSU and OneCLI instead match a vendor repository against the local system themselves and apply only
-the packages that fit. We therefore branch on the **manufacturer** only, and a new model needs no
-script change. Upstream's `dell_update`/`lenovo_update` functions are not used.
-
-- **Tools** come from Satellite custom products, installed with `dnf` (no files on the shared folder):
-  - Dell: `dell-system-update` (DSU), `srvadmin-idracadm`
-  - Lenovo: `lnvgy_utl_lxcer_onecli`
-- **Baseline:** `FIRMWARE_BASELINE=<name>` is set in the site config. Each vendor has one folder per
-  baseline: `$PACKAGEDIR/{Dell,Lenovo}/<baseline>/`. Changing the baseline means publishing a new folder
-  and changing that one variable. Old folders stay for rollback.
-- **Detection:** `manufacturer="$(dmidecode -s system-manufacturer)"`.
-- **Dell:** run DSU against the fixed catalog in `$PACKAGEDIR/Dell/<baseline>/` (contains `Catalog.xml`):
-  `dsu --non-interactive --apply-upgrades-only --source-type=REPOSITORY --source-location=<baseline dir>`.
-- **Lenovo:** run OneCLI against the fixed repository folder in `$PACKAGEDIR/Lenovo/<baseline>/`:
-  `onecli update flash --dir <baseline dir> --scope latest --nolog` (exact options checked during
-  testing). OneCLI picks the packages that match the node's machine type.
-- **Other manufacturers:** log a warning and skip firmware updates. This does **not** fail, so the
-  node still gets its software updates.
-- **Exit codes:** treat the documented "no updates needed" and "reboot required" exit codes of
-  DSU and OneCLI as success. Any other code stops with an error, so the node stays `DOWN`.
-- **Exceptions:** components that DSU/OneCLI do not cover (for example some NVIDIA/Mellanox adapters,
-  or the B200 HGX baseboard, see open question 4) are the only place a model-specific block may be
-  needed. They are added only when we find such a component.
-- Log firmware versions before and after (`racadm getversion` / `onecli inventory`) so we can check
-  the baseline was applied.
-
-## Phase 3: deployment
-
-| Item | Destination | How |
-|---|---|---|
-| `nodes/update_down_node.sh` | `/root/update_down_node.sh` on compute nodes | Ansible role (AAP), from the `cbe` branch |
-| `cbe/nodes/update_down_node.conf` | `/etc/sysconfig/update_down_node` | Ansible role |
-| `@reboot root /root/update_down_node.sh` | `/etc/cron.d/update_down_node` | Ansible role |
-| Packages needed: `dmidecode`, `s-nail`, `NetworkManager` | compute nodes | Ansible role / Satellite host group |
-| `cbe/nodes/update_software.sh`, `cbe/nodes/update_firmware.sh` | `$SCRIPTDIR` | Ansible play run on release |
-| Firmware repositories | `$PACKAGEDIR/{Dell,Lenovo}/<baseline>/` | built with Dell Repository Manager / `onecli update acquire` for the models in our inventory, reviewed by a second admin |
-
-Security requirements:
-
-- `$PACKAGEDIR` and `$SCRIPTDIR` are owned by root and writable **only** by root or the admin group,
-  because their contents run as root on every node.
-- The file system must be mounted at boot before cron runs. The script waits 90 s once and then gives up.
-- Root mail from compute nodes must reach the CBE admin mailbox.
-
-## Phase 4: testing
-
-On one node per hardware model (from the inventory), in a dedicated test reservation:
+On one node per hardware model, in a dedicated test reservation:
 
 | # | Test | Expected result |
 |---|---|---|
-| T1 | `sreboot -d -r UPDATE <node>` | Two reboots. Node is `IDLE` again with `Reason=Update_done` cleared. Packages match the content view. Firmware matches the baseline. |
-| T2 | Normal `scontrol reboot <node>` (NextState resume) | No update. Log says `nextstate=resume`. |
-| T3 | `scontrol update state=down reason=HW_fault`, then reboot | No update (stopped by `UPDATE_REASON`). Node stays `DOWN`. |
-| T4 | Hard power cycle of an idle node | `Node unexpectedly rebooted`, no update. |
-| T5 | `$PACKAGEDIR` not mounted | Mail to root, node stays `DOWN`. |
-| T6 | `dnf` fails (e.g. Satellite unreachable) | Error in `update.log`, node stays `DOWN`, no final reboot. |
-| T7 | `slurmd` disabled before the end of the update | At most `MAX_ATTEMPTS` reboots, then mail and node stays `DOWN`. |
-| T8 | Shared-partition node with jobs, after `reserve_on_idle` | Backfill only starts jobs that end before the reservation. Reservation is deleted after the update. |
-| T9 | Unknown manufacturer (or model missing from the repository) | Software updated. Firmware skipped with a warning (unknown manufacturer) or DSU/OneCLI reports nothing to apply. Node returns to service. |
+| T1 | `sreboot -d -r UPDATE <node>` | Two reboots. Node `IDLE`, packages match the content view, firmware matches the baseline. |
+| T2 | `scontrol reboot <node>` (normal reboot) | No update. Log says nothing to do. |
+| T3 | `scontrol update state=down reason=HW_fault`, then reboot | No update. Node stays `DOWN` with `HW_fault`. |
+| T4 | Hard power cycle of an idle node | No update (`Node unexpectedly rebooted` does not match). |
+| T5 | Firmware repository not mounted | Unit waits for the mount, then fails. `UPDATE_FAILED: firmware`, node stays `DOWN`. |
+| T6 | Satellite unreachable / `dnf` fails | `UPDATE_FAILED: software`, node stays `DOWN`, no reboot. |
+| T7 | Power loss during the update | Next boot runs the update again (`UPDATE: running`). After `MAX_ATTEMPTS`, `UPDATE_FAILED: attempts`. |
+| T8 | Shared-partition node with jobs, after `reserve_on_idle` | Backfill only starts jobs that end before the reservation. Reservation deleted after the update. |
+| T9 | Unknown manufacturer | Software updated, firmware skipped with a warning, node returns to service. |
+| T10 | GPU node, kernel update without matching NVIDIA kmod in the content view | `UPDATE_FAILED: checks`, node stays `DOWN`. |
+| T11 | Older content view promoted (rollback) | `distro-sync` downgrades packages to the content view. |
+| T12 | `--dry-run` on a node in service | Lists pending updates, changes nothing, does not touch the Slurm state. |
 
-## Phase 5: running an update round
+## Running an update round
 
 1. Publish and promote the new content-view version to the compute nodes' lifecycle environment.
-2. If needed, publish a new firmware baseline folder for Dell and/or Lenovo and set
-   `FIRMWARE_BASELINE` in the site config (deployed by Ansible).
-3. For shared partitions: `reserve_on_idle <nodes>`.
-4. `sreboot -d -r UPDATE <nodes>`, in batches (e.g. one rack or ≤10 % of a partition at a time).
-5. Monitor with `sinfo -R` and `sinfo -t down`. Nodes still `DOWN` with a reason other than `UPDATE`
-   or `Update_done` need checking (`/root/update_down_node.log`, `/root/update.log`).
+2. If needed, publish a new firmware baseline and set `FIRMWARE_BASELINE` in the inventory. Run the role.
+3. Optional: `cbe-node-update --dry-run` on a node in service to preview the changes.
+4. For shared partitions: `reserve_on_idle <nodes>`.
+5. `sreboot -d -r "UPDATE: <CV version>" <nodes>`, in batches (e.g. one rack or ≤10 % of a partition).
+6. Monitor `sinfo -R`. `UPDATE: running` = in progress. `UPDATE_FAILED: <step>` = check with
+   `journalctl -u cbe-node-update -b` on the node, fix, then resume or retrigger.
 
-This runbook goes into `cbe/nodes/README.md`.
-
-## Keeping in sync with upstream
-
-- Merge `upstream/master` into `master` (fast-forward), then `master` into `cbe`, as usual.
-- After each merge, run `git diff upstream/master cbe -- nodes/update_down_node.sh`. Once phase 1
-  is accepted upstream it should be empty. Otherwise it should contain only our separate
-  `update_down_node:` commits.
-- Upstream changes to `nodes/update_software.sh` and `nodes/update_firmware.sh` do not affect us,
-  because we use our own helpers and do not copy upstream's functions.
+This runbook goes into clip-cbe-cluster `docs/runbooks/`.
 
 ## Work breakdown
 
 | # | Task | Depends on |
 |---|---|---|
-| 1 | Collect the hardware model inventory (read-only `dmidecode` via `clush`) | none |
-| 2 | Decide the `PACKAGEDIR` location and the lifecycle environment | none |
-| 3 | Prepare and submit upstream PR 1 and PR 2 | none |
-| 4 | Add Satellite custom products for DSU, idracadm and OneCLI | none |
-| 5 | Write `cbe/nodes/update_down_node.conf`, `update_software.sh`, `update_firmware.sh` | 2 |
-| 6 | Build the first Dell and Lenovo firmware baseline repositories | 1, 2 |
-| 7 | Ansible role for deployment | 2, 5 |
-| 8 | Tests T1–T9 | 1, 4, 5, 6, 7 |
-| 9 | Write the `cbe/nodes/README.md` runbook | 8 |
-| 10 | First production round on one partition | 9 |
+| 1 | Hardware model inventory (read-only `dmidecode` via `clush`), for building the firmware repositories and choosing test nodes | none |
+| 2 | Decide the firmware repository location and the compute nodes' lifecycle environment | none |
+| 3 | Add Satellite custom products for DSU, idracadm and OneCLI | none |
+| 4 | Write `cbe-node-update`, systemd unit and config template | none |
+| 5 | Ansible role `node_update` in clip-cbe-cluster, plus Slurm_tools version bump on `control` | 2, 3, 4 |
+| 6 | Build the first Dell and Lenovo firmware baselines | 1, 2 |
+| 7 | Tests T1–T12 | 5, 6 |
+| 8 | Runbook in clip-cbe-cluster `docs/runbooks/` | 7 |
+| 9 | First production round on one partition | 8 |
 
 ## Open questions
 
-1. **Hardware models in use** (`dmidecode -s system-product-name` per node group). The scripts do not
-   depend on it. It decides which models the firmware repositories must cover and which nodes we test on.
-2. **Location of `PACKAGEDIR`/`SCRIPTDIR`**: which file system is mounted on all compute nodes at boot
-   and can be restricted to root/admins?
+1. **Hardware models in use.** The code does not depend on them. They decide what the firmware
+   repositories must contain and which nodes we test on.
+2. **Firmware repository location:** a file system mounted on all compute nodes at boot and writable
+   only by root/admins, or an internal HTTP server (DSU supports HTTP repositories; check OneCLI).
 3. **Lifecycle environment** for compute nodes, and whether "promote, then reboot" fits the existing
    release process (this login node uses `CLIP_CBE/Dev/ccv-hpc`).
-4. **NVIDIA B200 / HGX firmware:** add to the firmware helper later (`nvfwupd`), or keep it as a separate
-   process?
-5. **Mail:** does root mail from compute nodes currently reach the admin team?
+4. **NVIDIA B200 / HGX firmware:** add to the script later (`nvfwupd`), or keep it as a separate process?
+5. **Nodes built from images:** compute nodes are built with Packer. Do we update them in place with
+   `dnf`, or should a new image plus reprovisioning be the main path, with this mechanism only
+   for firmware and urgent fixes?
+6. **Where the plan lives:** move this document to clip-cbe-cluster `docs/` (e.g. as an ADR) now that
+   the code lives there.
