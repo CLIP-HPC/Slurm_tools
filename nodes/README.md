@@ -101,11 +101,18 @@ using [ClusterShell](https://wiki.fysik.dtu.dk/niflheim/SLURM#clustershell) (or 
 ```
 clush -bw <node-list> --copy update_down_node.sh --dest /root/
 ```
-5. On the compute nodes append a new entry to root's crontab file
-(``/var/spool/cron/root``, how you update this depends on your local management procedures):
+5. On the compute nodes append a new entry to root's crontab file ``/var/spool/cron/root``.
 ```
-@reboot /root/update_down_node.sh
+@reboot cat /root/update_down_node.sh | bash
 ```
+Notes:
+* The use of ```cat``` protects against a possible overwrite of the script (up to 128 kB) while executing.
+* How you update the crontab file depends on your local management procedures),
+  but one way is to create a file ```crontab_root``` and distribute it with:
+```
+clush -bw <node-list> --copy crontab_root --dest /var/spool/cron/root
+```
+
 
 ### Making semi-automatic updates
 
@@ -122,6 +129,18 @@ and ```update.log``` from the software and firmware updates.
 
 Note: Nodes that have ```State=down``` with a ```Reason=Node unexpectedly rebooted``` are assumed 
 to be unrelated to the present update system and will therefore be skipped.
+
+### Power saving: Updating nodes in powered_down state
+
+If you have configured [Slurm power saving](https://slurm.schedmd.com/power_save.html)
+there may be powered-off nodes with ```State=powered_down``` which need to be updated,
+identify such nodes with ```sinfo -t powered_down```.
+However, the ```scontrol reboot``` command will skip such nodes.
+The solution is to request Slurm to power up the nodes followed immediately by a reboot:
+```
+scontrol power up <node-list>
+scontrol reboot asap nextstate=down <node-list>
+```
 
 ### Optional for mixed state nodes
 
