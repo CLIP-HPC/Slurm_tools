@@ -59,3 +59,12 @@ Slurm error numbers
 Error numbers are defined in the source file ```/usr/include/slurm/slurm_errno.h```.
 Prior to Slurm 23.02 we had to define error symbols manually, see [bug 14500](https://bugs.schedmd.com/show_bug.cgi?id=14500),
 and only a few selected symbols ESLURM_* are exposed to the Lua script.
+
+Tests
+-----
+
+`tests/job_submit_test.lua` runs `slurm_job_submit()` and `slurm_job_modify()` against a stubbed `slurm` table.
+Run it from the `plugins` directory with the Lua version of the Slurm controller:
+```
+cd plugins && lua tests/job_submit_test.lua
+```

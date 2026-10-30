@@ -41,11 +41,11 @@ slurm.ESLURM_INVALID_GRES=2072
 -- Define our partitions and defaults
 --
 partitions = {
-	-- partition name (NOTE: a substring which begins the name), has gpus
+	-- partition name (NOTE: the name, or a prefix followed by "_"), has gpus
 	-- Multiple partitions can be lumped together, for example, xeon24, xeon24_512, xeon24_1024 as "xeon24"
 	{ partition="c", has_gpus=false },
 	{ partition="m", has_gpus=false },
-	{ partition="g", has_gpus=true },
+	{ partition="g", has_gpus=true, gpus_per_node=4 },	-- gpus_per_node: full GPUs, required for --exclusive
 }
 interactive_max_time=240	-- Default maximum time in minutes for all interactive jobs
 default_qos="short"		-- Default QOS if none was requested
@@ -54,8 +54,9 @@ script_error="ERROR: Please modify your batch job script"
 -- High-memory node configuration
 highmem = {
 	partition="m",			-- Partition name prefix for high-memory nodes
-	min_mem_per_node=700000,	-- Minimum memory per node in MB
-	cores_per_node=32,		-- Cores per node (used to derive minimum memory per CPU)
+	min_mem_per_node=204800,	-- Minimum memory per node in MB for batch jobs
+	interactive_min_mem_per_node=65536,	-- Minimum memory per node in MB for interactive sessions
+	cores_per_node=160,		-- Cores per node (used to derive minimum memory per CPU)
 }
 
 -- Interactive sessions (OpenOnDemand, salloc, srun --pty)
@@ -72,6 +73,71 @@ interactive = {
 --
 -- Define functions to be used
 --
+
+-- Return the list of partitions requested by the job (the default partition if none)
+function job_partitions (job_desc, part_list)
+	local parts = {}
+	local requested = job_desc.partition or default_partition(part_list)
+	if requested ~= nil then
+		for part in string.gmatch(requested, "[^,]+") do
+			table.insert(parts, part)
+		end
+	end
+	return parts
+end
+
+-- True if partition part is the partition prefix or begins with prefix followed by "_"
+-- (so that "g_long" belongs to "g", but "grid" does not)
+function partition_matches (part, prefix)
+	return part == prefix or string.find(part, prefix .. "_", 1, true) == 1
+end
+
+-- Return the first requested partition that matches prefix, or nil
+function find_partition (job_desc, part_list, prefix)
+	for i, part in ipairs(job_partitions(job_desc, part_list)) do
+		if partition_matches(part, prefix) then
+			return part
+		end
+	end
+	return nil
+end
+
+-- True if the job has no batch script (salloc, srun outside an allocation)
+function is_scriptless (job_desc)
+	return job_desc.script == nil or job_desc.script == ""
+end
+
+-- Parse a TRES string such as "gres/gpu:2,gres/gpu:nvidia_b200_1g.23gb:1" (from --gpus*, --gres)
+-- Returns the number of GPUs, the number of full (non-MIG) GPUs, and whether any GPU was named
+function count_gpus (tres)
+	local total, full, named = 0, 0, false
+	if tres == nil then
+		return total, full, named
+	end
+	for spec in string.gmatch(tres, "[^,]+") do
+		if string.find(spec, "gpu", 1, true) then
+			named = true
+			local count = tonumber(string.match(spec, "[:=](%d+)$")) or 1
+			total = total + count
+			-- MIG slices have a type such as nvidia_b200_1g.23gb
+			if not string.find(spec, "%dg%.%d+gb") then
+				full = full + count
+			end
+		end
+	end
+	return total, full, named
+end
+
+-- Sum count_gpus over the --gpus*/--gres fields of job_desc
+-- (job_desc.gres is an alias of tres_per_node, so it is not counted separately)
+function count_job_gpus (job_desc)
+	local total, full, named = 0, 0, false
+	for i, field in ipairs({ "tres_per_job", "tres_per_node", "tres_per_socket", "tres_per_task" }) do
+		local t, f, n = count_gpus(job_desc[field])
+		total, full, named = total + t, full + f, named or n
+	end
+	return total, full, named
+end
 
 -- Check for interactive jobs
 function check_interactive_job (job_desc, part_list, submit_uid, log_prefix)
@@ -216,17 +282,21 @@ end
 -- Check usage of big-memory nodes using --mem=xxx etc.
 function check_big_memory (job_desc, part_list, submit_uid, log_prefix)
 	local min_mem_per_node = highmem.min_mem_per_node
-	local min_mem_per_cpu = highmem.min_mem_per_node / highmem.cores_per_node
+	if job_desc.qos == interactive.qos then
+		min_mem_per_node = highmem.interactive_min_mem_per_node
+	end
+	local min_mem_per_cpu = min_mem_per_node / highmem.cores_per_node
 	local usage_page="https://docs.vbc.ac.at/books/scientific-computing/chapter/cbenext"
-	-- This check only applies to the high-memory partition (return otherwise)
-	if string.find(job_desc.partition, highmem.partition, 1, true) ~= 1 then
+	-- This check applies to jobs that may run in the high-memory partition (return otherwise)
+	local part = find_partition(job_desc, part_list, highmem.partition)
+	if part == nil then
 		return slurm.SUCCESS
 	end
 	if job_desc.min_mem_per_node == nil and job_desc.min_mem_per_cpu == nil then
 		-- Neither min_mem_per_node nor min_mem_per_cpu was specified
 		slurm.log_info("%s: user %s %s Job did not specify min_mem_per_* for partition %s",
-			log_prefix, userinfo, badstring, job_desc.partition)
-		slurm.log_user("Big-memory partition %s requires jobs to specify memory explicitly.", job_desc.partition)
+			log_prefix, userinfo, badstring, part)
+		slurm.log_user("Big-memory partition %s requires jobs to specify memory explicitly.", part)
 		slurm.log_user("See the Wiki page %s", usage_page)
 		return slurm.ESLURM_INVALID_TASK_MEMORY
 	end
@@ -234,14 +304,14 @@ function check_big_memory (job_desc, part_list, submit_uid, log_prefix)
 	-- so we need to check carefully for any nil values (see bug 19564)
 	if job_desc.min_mem_per_node ~= nil and job_desc.min_mem_per_node < min_mem_per_node then
 		slurm.log_user("Big-memory partition %s requires jobs to specify a memory per node of at least %d MB",
-			job_desc.partition, min_mem_per_node)
+			part, min_mem_per_node)
 		slurm.log_user("Your job requested %s MB", job_desc.min_mem_per_node)
 		slurm.log_user("See the Wiki page %s", usage_page)
 		return slurm.ESLURM_INVALID_TASK_MEMORY
 	end
 	if job_desc.min_mem_per_cpu ~= nil and job_desc.min_mem_per_cpu < min_mem_per_cpu then
 		slurm.log_user("Big-memory partition %s requires jobs to specify a memory per cpu of at least %d MB",
-			job_desc.partition, min_mem_per_cpu)
+			part, min_mem_per_cpu)
 		slurm.log_user("Your job requested %s MB", job_desc.min_mem_per_cpu)
 		slurm.log_user("See the Wiki page %s", usage_page)
 		return slurm.ESLURM_INVALID_TASK_MEMORY
@@ -253,7 +323,7 @@ end
 function check_memory (job_desc, part_list, submit_uid, log_prefix)
 	local good_mem_core_ratio = 5000	-- MB per core considered a normal request
 	-- Only applies to the regular compute partition
-	if string.find(job_desc.partition, "c", 1, true) ~= 1 then
+	if find_partition(job_desc, part_list, "c") == nil then
 		return slurm.SUCCESS
 	end
 	-- Only warn for single-node jobs
@@ -293,57 +363,104 @@ function forbid_memory_eq_0 (job_desc, part_list, submit_uid, log_prefix)
 end
 
 
--- Check if GPU partitions are used correctly
+-- Check if GPU partitions are used correctly:
+-- Jobs that may run in a GPU partition must request 1 or more GPUs, and --exclusive
+-- requires all GPUs of the node, so that no GPU node is blocked by a job that does not use its GPUs
 function check_gpus (job_desc, part_list, submit_uid, log_prefix)
-	-- Loop over partitions
 	for i, p in ipairs(partitions) do
 		if p.has_gpus then
-			-- Code adapted from https://lists.schedmd.com/pipermail/slurm-users/2020-December/006459.html
-			if string.find(job_desc.partition,p.partition,1,true) == 1 then
-				-- partition name begins with p.partition
-				if job_desc.gres ~= nil then
-					if string.find(job_desc.gres, "gpu") then
-						-- Get number of GPUs specified and validate the count
-						local numgpu = string.match(job_desc.gres, ":%d+$")
-						if numgpu ~= nil then
-							numgpu = numgpu:gsub(':', '')
-							if tonumber(numgpu) < 1 then
-								-- Alert on invalid gpu count - eg: gpu:0 , gpu:p100:0
-								slurm.log_info("%s: user %s %s Invalid GPU count specified in GRES",
-									log_prefix, userinfo, badstring)
-								slurm.log_user("Invalid GPU count specified in GRES, must be greater than 0")
-								slurm.log_user(script_error)
-								return slurm.ESLURM_INVALID_GRES
-							end
-						end
-					else
-						-- GRES specified but no "gpu" was given
-						slurm.log_info("%s: user %s %s No GPUs specified in GRES for GPU partition %s",
-							log_prefix, userinfo, badstring, job_desc.partition)
-						slurm.log_user("No GPU GRES was specified, GRES must be 1 or more GPUs in partition %s",
-							job_desc.partition)
-						slurm.log_user(script_error)
+			local part = find_partition(job_desc, part_list, p.partition)
+			if part ~= nil then
+				return check_gpu_request(job_desc, p, part, log_prefix)
+			end
+		end
+	end
+	return slurm.SUCCESS
+end
+
+-- Validate the GPU request of a job that may run in the GPU partition p (requested as part)
+function check_gpu_request (job_desc, p, part, log_prefix)
+	local total, full, named = count_job_gpus(job_desc)
+	if not named then
+		slurm.log_info("%s: user %s %s No GPUs requested for GPU partition %s",
+			log_prefix, userinfo, badstring, part)
+		slurm.log_user("Partition %s requires 1 or more GPUs, for example --gpus=1 or --gres=gpu:1", part)
+		slurm.log_user(script_error)
+		return slurm.ESLURM_INVALID_GRES
+	end
+	if total < 1 then
+		slurm.log_info("%s: user %s %s Invalid GPU count requested for GPU partition %s",
+			log_prefix, userinfo, badstring, part)
+		slurm.log_user("Invalid GPU count requested, must be greater than 0 in partition %s", part)
+		slurm.log_user(script_error)
+		return slurm.ESLURM_INVALID_GRES
+	end
+	if (job_desc.tres_per_socket ~= nil or job_desc.tres_per_task ~= nil) and
+			job_desc.num_tasks == slurm.NO_VAL then
+		slurm.log_user("--gpus-per-task and --gpus-per-socket options require --ntasks specification")
+		slurm.log_user(script_error)
+		return slurm.ESLURM_BAD_TASK_COUNT
+	end
+	-- job_desc.shared is 0 (JOB_SHARED_NONE) for --exclusive, but not for --exclusive=user
+	if job_desc.shared == 0 and p.gpus_per_node ~= nil then
+		-- --exclusive: the job must request all full GPUs of each node
+		local per_node = full_gpus_per_node(job_desc)
+		if per_node < p.gpus_per_node then
+			slurm.log_info("%s: user %s %s Exclusive job with %d full GPUs per node in partition %s",
+				log_prefix, userinfo, badstring, per_node, part)
+			slurm.log_user("--exclusive in partition %s requires all %d GPUs per node, for example --gpus-per-node=%d",
+				part, p.gpus_per_node, p.gpus_per_node)
+			slurm.log_user("Without --exclusive, jobs share the node and only get the GPUs they request")
+			slurm.log_user(script_error)
+			return slurm.ESLURM_INVALID_GRES
+		end
+	end
+	return slurm.SUCCESS
+end
+
+-- Return the number of full (non-MIG) GPUs the job requests per node
+function full_gpus_per_node (job_desc)
+	local function set (value)
+		return value ~= nil and value ~= slurm.NO_VAL and value ~= slurm.NO_VAL16 and value > 0
+	end
+	local nodes = 1
+	if set(job_desc.min_nodes) then
+		nodes = job_desc.min_nodes
+	end
+	local _, per_node = count_gpus(job_desc.tres_per_node)
+	local _, per_job = count_gpus(job_desc.tres_per_job)
+	per_node = math.max(per_node, per_job / nodes)
+	local _, per_task = count_gpus(job_desc.tres_per_task)
+	if set(job_desc.ntasks_per_node) then
+		per_node = math.max(per_node, per_task * job_desc.ntasks_per_node)
+	elseif set(job_desc.num_tasks) then
+		per_node = math.max(per_node, per_task * job_desc.num_tasks / nodes)
+	end
+	local _, per_socket = count_gpus(job_desc.tres_per_socket)
+	if set(job_desc.sockets_per_node) then
+		per_node = math.max(per_node, per_socket * job_desc.sockets_per_node)
+	end
+	return per_node
+end
+
+-- Sanity check of modified GPU requests in GPU partitions
+function modify_gpus (job_desc, job_ptr, part_list, modify_uid, log_prefix)
+	if job_desc.tres_per_job == nil and job_desc.tres_per_node == nil and
+			job_desc.tres_per_socket == nil and job_desc.tres_per_task == nil then
+		-- The case where the modify request does not modify the GPUs
+		return slurm.SUCCESS
+	end
+	for i, p in ipairs(partitions) do
+		if p.has_gpus and job_ptr.partition ~= nil then
+			for part in string.gmatch(job_ptr.partition, "[^,]+") do
+				if partition_matches(part, p.partition) then
+					local total, full, named = count_job_gpus(job_desc)
+					if not named or total < 1 then
+						slurm.log_user("Partition %s requires 1 or more GPUs", part)
 						return slurm.ESLURM_INVALID_GRES
 					end
-				elseif job_desc.tres_per_job ~= nil and string.find(job_desc.tres_per_job, "gpu") then
-					-- --gpus/-G: GPU count for the whole job, no task count needed
-				elseif job_desc.tres_per_node ~= nil or job_desc.tres_per_socket ~= nil or job_desc.tres_per_task ~= nil then
-					-- Alternative use of gpus in newer versions of slurm
-					if job_desc.num_tasks == slurm.NO_VAL then
-						slurm.log_user("--gpus-per-task option requires --tasks specification")
-						slurm.log_user(script_error)
-						return slurm.ESLURM_BAD_TASK_COUNT
-					end
-				else
-					-- No GRES specified
-					slurm.log_info("%s: user %s %s No GRES specified for GPU partition %s",
-						log_prefix, userinfo, badstring, job_desc.partition)
-					slurm.log_user("No GRES was specified, GRES must be 1 or more GPUs in partition %s",
-						job_desc.partition)
-					slurm.log_user(script_error)
-					return slurm.ESLURM_INVALID_GRES
+					return slurm.SUCCESS
 				end
-				break	-- no more partitions to check
 			end
 		end
 	end
@@ -366,6 +483,11 @@ function set_qos (job_desc, part_list, submit_uid, log_prefix)
 	local submit_part = job_desc.partition
 	local is_grid_job = submit_part == "grid"
 	if qos == nil then
+		if is_scriptless(job_desc) and not is_grid_job then
+			-- salloc and srun without a batch script are interactive sessions (see set_interactive)
+			job_desc.qos = interactive.qos
+			return slurm.SUCCESS
+		end
 		qos = default_qos
 	end
 	-- Skip if QOS already contains '_', meaning it has already been formatted
@@ -501,7 +623,7 @@ function slurm_job_modify(job_desc, job_ptr, part_list, modify_uid)
 		end
 	end
 	-- Loop over the function list no. 2 for checking job_desc as well as job_ptr
-	local functionlist2 = { modify_partition, modify_num_nodes, modify_num_tasks }
+	local functionlist2 = { modify_partition, modify_num_nodes, modify_num_tasks, modify_gpus }
 	for i, func in ipairs(functionlist2) do
 		check = func(job_desc, job_ptr, part_list, modify_uid, log_prefix)
 		if check ~= slurm.SUCCESS then
