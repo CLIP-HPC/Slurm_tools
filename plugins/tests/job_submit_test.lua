@@ -111,7 +111,7 @@ check("salloc on g with a GPU gets interactive_gpu",
 	job{ partition = "g", script = "", tres_per_job = "gres/gpu:1" }, OK,
 	{ qos = "interactive", reservation = "interactive_gpu" })
 
--- Partition g: 1 or more GPUs, and --exclusive only with all GPUs of the node
+-- Partition g: 1 or more GPUs, also with --exclusive (Slurm then allocates all GPUs of the node)
 check("g without GPUs is rejected", job{ partition = "g" }, GRES)
 check("c,g without GPUs is rejected", job{ partition = "c,g" }, GRES)
 check("--qos=g_short without -p and without GPUs is accepted on the default partition",
@@ -128,21 +128,33 @@ check("--gpus-per-task without --ntasks is rejected",
 	job{ partition = "g", tres_per_task = "gres/gpu:1" }, slurm.ESLURM_BAD_TASK_COUNT)
 check("--gpus-per-task with --ntasks is accepted",
 	job{ partition = "g", tres_per_task = "gres/gpu:1", num_tasks = 2 }, OK)
-check("--exclusive --gpus=1 is rejected",
-	job{ partition = "g", tres_per_job = "gres/gpu:1", shared = 0 }, GRES)
-check("--exclusive --gpus=4 is accepted",
-	job{ partition = "g", tres_per_job = "gres/gpu:4", shared = 0 }, OK)
-check("--exclusive -N2 --gpus-per-node=4 is accepted",
-	job{ partition = "g", tres_per_node = "gres/gpu:4", min_nodes = 2, shared = 0 }, OK)
-check("--exclusive -N2 --gpus=4 is rejected",
-	job{ partition = "g", tres_per_job = "gres/gpu:4", min_nodes = 2, shared = 0 }, GRES)
-check("--exclusive with 4 MIG slices is rejected",
-	job{ partition = "g", tres_per_job = "gres/gpu:nvidia_b200_1g.23gb:4", shared = 0 }, GRES)
-check("--exclusive --ntasks-per-node=4 --gpus-per-task=1 is accepted",
-	job{ partition = "g", tres_per_task = "gres/gpu:1", num_tasks = 4, ntasks_per_node = 4, shared = 0 }, OK)
-check("--exclusive=user --gpus=1 is accepted",
-	job{ partition = "g", tres_per_job = "gres/gpu:1", shared = 2 }, OK)
-check("--exclusive on c is accepted", job{ partition = "c", shared = 0 }, OK)
+check("--exclusive --gpus=1 is accepted",
+	job{ partition = "g", tres_per_job = "gres/gpu:1", shared = 0 }, OK, { min_mem_per_node = 0 })
+check("--exclusive with a MIG slice is accepted",
+	job{ partition = "g", tres_per_job = "gres/gpu:nvidia_b200_1g.23gb:1", shared = 0 }, OK)
+check("--exclusive on g without GPUs is rejected", job{ partition = "g", shared = 0 }, GRES)
+check("--exclusive=user --gpus=1 keeps its memory request",
+	job{ partition = "g", tres_per_job = "gres/gpu:1", shared = 2, min_mem_per_node = 8 * G }, OK,
+	{ min_mem_per_node = 8 * G })
+
+-- --exclusive allocates all memory of the node
+check("--exclusive on c without --mem gets all memory",
+	job{ partition = "c", shared = 0 }, OK, { min_mem_per_node = 0 })
+check("--exclusive on c with --mem=8G gets all memory",
+	job{ partition = "c", shared = 0, min_mem_per_node = 8 * G }, OK, { min_mem_per_node = 0 })
+local mpg = job{ partition = "g", shared = 0, tres_per_job = "gres/gpu:1", mem_per_tres = "gres/gpu:16384" }
+check("--exclusive on g with --mem-per-gpu gets all memory", mpg, OK, { min_mem_per_node = 0 })
+count = count + 1
+if mpg.mem_per_tres ~= nil then
+	failures = failures + 1
+	print("FAIL --exclusive on g drops --mem-per-gpu: mem_per_tres=" .. mpg.mem_per_tres)
+else
+	print("ok   --exclusive on g drops --mem-per-gpu")
+end
+check("--exclusive on m without --mem is accepted",
+	job{ partition = "m", shared = 0 }, OK, { min_mem_per_node = 0 })
+check("--exclusive with --mem=0 is still rejected",
+	job{ partition = "c", shared = 0, min_mem_per_node = 0 }, MEM)
 
 -- scontrol update of a running job
 local function modify (name, desc, ptr, want_rc)
