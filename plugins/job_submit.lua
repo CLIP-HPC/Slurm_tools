@@ -148,8 +148,10 @@ function check_interactive_job (job_desc, part_list, submit_uid, log_prefix)
 		slurm.log_user("NOTICE: Job script is missing, assuming an interactive job")
 		local max_time = interactive_max_time
 		if job_desc.partition == nil or job_desc.partition == "" then	-- Just a sanity check of partition
-			job_desc.time_limit = max_time	-- Set a new job max_time
-			slurm.log_user("Interactive job time limit is set to %d minutes", max_time)
+			if job_desc.time_limit == nil or job_desc.time_limit > max_time then
+				job_desc.time_limit = max_time	-- Set a new job max_time
+				slurm.log_user("Interactive job time limit is set to %d minutes", max_time)
+			end
 			return slurm.SUCCESS
 		end
 		-- Loop over the (possibly multiple) partitions requested by the job

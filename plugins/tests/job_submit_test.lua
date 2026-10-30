@@ -96,8 +96,12 @@ check("salloc on m with 128G is accepted",
 -- salloc and srun without a batch script default to the interactive QOS
 check("salloc without --qos gets interactive", job{ partition = "c", script = "" }, OK,
 	{ qos = "interactive", reservation = "interactive" })
-check("salloc without -p gets interactive", job{ script = "" }, OK,
-	{ qos = "interactive", reservation = "interactive" })
+check("salloc without -p gets interactive and keeps its time limit", job{ script = "" }, OK,
+	{ qos = "interactive", reservation = "interactive", time_limit = 60 })
+check("salloc without -p and without --time gets 240 minutes",
+	job{ script = "", time_limit = slurm.NO_VAL }, OK, { time_limit = 240 })
+check("salloc with --time=600 is capped at 240 minutes",
+	job{ partition = "c", script = "", time_limit = 600 }, OK, { time_limit = 240 })
 check("salloc with --qos=long keeps it", job{ partition = "c", script = "", qos = "long" }, OK,
 	{ qos = "c_long", reservation = nil })
 check("salloc on grid keeps the grid QOS", job{ partition = "grid", script = "" }, OK,
