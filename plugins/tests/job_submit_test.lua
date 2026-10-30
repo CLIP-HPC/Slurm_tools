@@ -78,20 +78,20 @@ end
 local OK, GRES, MEM = slurm.SUCCESS, slurm.ESLURM_INVALID_GRES, slurm.ESLURM_INVALID_TASK_MEMORY
 local G = 1024
 
--- Partition m: 200 GB floor for batch jobs, 64 GB for interactive sessions
+-- Partition m: 200 GB floor for batch jobs, 128 GB for interactive sessions
 check("batch on m with 32G is rejected", job{ partition = "m", min_mem_per_node = 32 * G }, MEM)
 check("batch on m with 250G is accepted", job{ partition = "m", min_mem_per_node = 250 * G }, OK,
 	{ qos = "m_short" })
 check("batch on m without --mem is rejected", job{ partition = "m" }, MEM)
 check("batch on c,m with 32G is rejected", job{ partition = "c,m", min_mem_per_node = 32 * G }, MEM)
 check("batch on m with 2G per CPU is accepted", job{ partition = "m", min_mem_per_cpu = 2 * G }, OK)
-check("OOD RStudio on m with 64G is accepted",
-	job{ partition = "m", alloc_node = "cbe-ood-1", min_mem_per_node = 64 * G }, OK,
+check("OOD RStudio on m with 128G is accepted",
+	job{ partition = "m", alloc_node = "cbe-ood-1", min_mem_per_node = 128 * G }, OK,
 	{ qos = "interactive" })
-check("OOD RStudio on m with 32G is rejected",
-	job{ partition = "m", alloc_node = "cbe-ood-1", min_mem_per_node = 32 * G }, MEM)
-check("salloc on m with 64G is accepted",
-	job{ partition = "m", script = "", min_mem_per_node = 64 * G }, OK, { qos = "interactive" })
+check("OOD RStudio on m with 64G is rejected",
+	job{ partition = "m", alloc_node = "cbe-ood-1", min_mem_per_node = 64 * G }, MEM)
+check("salloc on m with 128G is accepted",
+	job{ partition = "m", script = "", min_mem_per_node = 128 * G }, OK, { qos = "interactive" })
 
 -- salloc and srun without a batch script default to the interactive QOS
 check("salloc without --qos gets interactive", job{ partition = "c", script = "" }, OK,
