@@ -55,7 +55,7 @@ script_error="ERROR: Please modify your batch job script"
 highmem = {
 	partition="m",			-- Partition name prefix for high-memory nodes
 	min_mem_per_node=204800,	-- Minimum memory per node in MB for batch jobs
-	interactive_min_mem_per_node=65536,	-- Minimum memory per node in MB for interactive sessions
+	interactive_min_mem_per_node=131072,	-- Minimum memory per node in MB for interactive sessions (OpenOnDemand, salloc)
 	cores_per_node=160,		-- Cores per node (used to derive minimum memory per CPU)
 }
 
