@@ -107,6 +107,13 @@ check("salloc with --qos=long keeps it", job{ partition = "c", script = "", qos 
 check("salloc on grid keeps the grid QOS", job{ partition = "grid", script = "" }, OK,
 	{ qos = nil })
 check("sbatch without --qos gets short", job{ partition = "c" }, OK, { qos = "c_short" })
+check("sbatch het job: first component is a batch job",
+	job{ partition = "c", het_job_offset = 0 }, OK, { qos = "c_short", reservation = nil })
+check("sbatch het job: later component without script is a batch job",
+	job{ partition = "c", script = "", het_job_offset = 1, time_limit = 600 }, OK,
+	{ qos = "c_short", reservation = nil, time_limit = 600 })
+check("salloc without het job offset is interactive",
+	job{ partition = "c", script = "", het_job_offset = slurm.NO_VAL }, OK, { qos = "interactive" })
 check("salloc on g with a GPU gets interactive_gpu",
 	job{ partition = "g", script = "", tres_per_job = "gres/gpu:1" }, OK,
 	{ qos = "interactive", reservation = "interactive_gpu" })
