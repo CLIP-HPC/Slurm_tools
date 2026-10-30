@@ -102,8 +102,14 @@ function find_partition (job_desc, part_list, prefix)
 	return nil
 end
 
--- True if the job has no batch script (salloc, srun outside an allocation)
+-- True if the job has no batch script (salloc, srun outside an allocation).
+-- Only the first component of an sbatch heterogeneous job carries the script, so later
+-- components (het_job_offset > 0) count as batch jobs.
 function is_scriptless (job_desc)
+	local offset = job_desc.het_job_offset
+	if offset ~= nil and offset ~= slurm.NO_VAL and offset > 0 then
+		return false
+	end
 	return job_desc.script == nil or job_desc.script == ""
 end
 
@@ -156,7 +162,7 @@ end
 
 -- Check for interactive jobs
 function check_interactive_job (job_desc, part_list, submit_uid, log_prefix)
-	if job_desc.script == nil or job_desc.script == "" then
+	if is_scriptless(job_desc) then
 		-- Job script is missing, so we assume that this is an interactive job
 		slurm.log_info("%s: user %s submitted an interactive job to partition(s) %s",
 			log_prefix, userinfo, job_desc.partition or "(default)")
