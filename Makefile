@@ -5,7 +5,7 @@ SBINDIR=$(PREFIX)/sbin
 pestat=pestat/pestat
 slurm_tools_completion=bash-completion/slurm_tools_completion.sh
 
-usertools=showuserjobs/showuserjobs showuserlimits/showuserlimits
+usertools=showuserjobs/showuserjobs showuserlimits/showuserlimits slurm_tool/slurm
 accountingtools=slurmacct/slurmacct slurmacct/jobacctstats slurmacct/topreports slurmreportmonth/slurmreportmonth
 slurmaccounttools=slurmaccounts/slurmaccounts slurmaccounts/slurmusersettings slurmaccounts/updateuserlimits slurmaccounts/slurmusertable \
 		  slurmaccounts/showusertres slurmaccounts/showrecentusers slurmaccounts/showdeletedusers
