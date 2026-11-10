@@ -64,10 +64,10 @@ cmd_prio="sprio -o"
 cmd_dead="sinfo -R -o '%20E %6t %N'"
 cmd_top="squeue -haO"
 cmd_res="squeue -hO"
-cmd_features="sinfo -o '%50N %18F %26f %30G'"
+cmd_features="sinfo -o '%50N %18F %26f %45G'"
 merge="/usr/bin/uniq -c"
 clean="/usr/bin/column -t"
-prune="/bin/grep -v '\ 0\ \ '"
+prune="/bin/grep -v ' 0  '"
 
 if [ -z "$COLUMNS" ]; then
     COLUMNS=$(tput cols)
@@ -335,11 +335,11 @@ function top_users {
 	queue)  state="PENDING" ;;
 	*)      state="RUNNING" ;;
     esac
-    echo "      User  Jobs x Cores GPUs   Mem(GB) GB/c  Jobs"
+    echo "                User  Jobs x Cores GPUs   Mem(GB) GB/c  Jobs"
     eval "$cmd_top '$fmt_top'" -t $state | awk -v w=$COLUMNS 'BEGIN{FS="|"} '"$awk_tres"'
   {jn[$1]+=1; j[$1]=j[$1]" "$2"["$3"]"; c[$1]+=$3; g[$1]+=tres($4,"gres/gpu"); m[$1]+=tres($4,"mem");}
-  END{for(u in c){printf "%10s %5d x %-5d %4d %8.1f %5.1f  %s\n",
-    u,jn[u],c[u],g[u],m[u]/1024,m[u]/c[u]/1024,substr(j[u],2,w-47);}}' | sort -nrk4
+  END{for(u in c){printf "%20.20s %5d x %-5d %4d %8.1f %5.1f  %s\n",
+    u,jn[u],c[u],g[u],m[u]/1024,m[u]/c[u]/1024,substr(j[u],2,w-57);}}' | sort -nrk4
 }
 
 function qosqueue {
