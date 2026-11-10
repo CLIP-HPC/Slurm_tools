@@ -23,7 +23,7 @@ fmt_short="%8Q %9P %.8u [ %.4C x %5D %7m : %8f ] %.11l %.8T %r"
 fmt_shorter="%9P %.8u [ %.4C x %5D %7m : %8f & %6q ] %.11l %.8T %r"
 fmt_full="%Q %i %P %j %u %C %D %m %f %q %h %t %M %l %R"
 fmt_s_parts="%10P %.11l %.15F %10f %15G %N"
-fmt_s_nodes="%.5D %.10T %.4c %.7m %10f %25G %N"
+fmt_s_nodes="%.5D %.10T %.4c %.7m %10f %45G %N"
 fmt_s_prio="%.8u %.10Y %.10F %.10J %.10A %.10Q %.12P"
 fmt_s_prio_all="%.8u %.12i %.10Y %.10F %.10J %.10A %.10Q %.12P"
 fmt_s_prio_user="%.12i %.10Y %.10F %.10J %.10A %.10Q %.12P"
@@ -45,6 +45,17 @@ function tres(s, k,   n, i, a, kv) {
     n = split(s, a, ",")
     for (i = 1; i <= n; i++) { split(a[i], kv, "="); if (kv[1] == k) return (k == "mem") ? tomb(kv[2]) : kv[2] }
     return 0
+}
+# full GPUs (mig=0) or MIG slices (mig=1) from the typed gres/gpu:<type>=N entries;
+# MIG types carry a profile like _1g.23gb. Untyped requests count as full GPUs.
+function gpus(s, mig,   n, i, a, kv, typed, full, sl) {
+    n = split(s, a, ",")
+    for (i = 1; i <= n; i++) {
+        split(a[i], kv, "=")
+        if (kv[1] ~ /^gres\/gpu:/) { typed = 1; if (kv[1] ~ /_[0-9]+g\./) sl += kv[2]; else full += kv[2] }
+    }
+    if (!typed) full = tres(s, "gres/gpu")
+    return mig ? sl+0 : full+0
 }'
 
 cmd_watch="/usr/bin/watch -n 15 --no-title"
@@ -335,11 +346,11 @@ function top_users {
 	queue)  state="PENDING" ;;
 	*)      state="RUNNING" ;;
     esac
-    echo "                User  Jobs x Cores GPUs   Mem(GB) GB/c  Jobs"
+    echo "                User  Jobs x Cores GPUs  MIG   Mem(GB) GB/c  Jobs"
     eval "$cmd_top '$fmt_top'" -t $state | awk -v w=$COLUMNS 'BEGIN{FS="|"} '"$awk_tres"'
-  {jn[$1]+=1; j[$1]=j[$1]" "$2"["$3"]"; c[$1]+=$3; g[$1]+=tres($4,"gres/gpu"); m[$1]+=tres($4,"mem");}
-  END{for(u in c){printf "%20.20s %5d x %-5d %4d %8.1f %5.1f  %s\n",
-    u,jn[u],c[u],g[u],m[u]/1024,m[u]/c[u]/1024,substr(j[u],2,w-57);}}' | sort -nrk4
+  {jn[$1]+=1; j[$1]=j[$1]" "$2"["$3"]"; c[$1]+=$3; g[$1]+=gpus($4,0); s[$1]+=gpus($4,1); m[$1]+=tres($4,"mem");}
+  END{for(u in c){printf "%20.20s %5d x %-5d %4d %4d %8.1f %5.1f  %s\n",
+    u,jn[u],c[u],g[u],s[u],m[u]/1024,m[u]/c[u]/1024,substr(j[u],2,w-62);}}' | sort -nrk4
 }
 
 function qosqueue {
@@ -359,10 +370,10 @@ function userqos {
 }
 
 function rescount {
-    echo "Partition    Cores  GPUs   Memory   AvgSize"
+    echo "Partition    Cores  GPUs   MIG   Memory   AvgSize"
     eval "$cmd_res '$fmt_res'" -t $1 | awk 'BEGIN{FS="|"} '"$awk_tres"'
-  {c[$1]+=$2; g[$1]+=tres($3,"gres/gpu"); m[$1]+=tres($3,"mem")}
-  END{for(p in c){printf "%-10s %7i %5i %7.0fG %8iM\n",p,c[p],g[p],m[p]/1024,m[p]/c[p]}}'
+  {c[$1]+=$2; g[$1]+=gpus($3,0); s[$1]+=gpus($3,1); m[$1]+=tres($3,"mem")}
+  END{for(p in c){printf "%-10s %7i %5i %5i %7.0fG %8iM\n",p,c[p],g[p],s[p],m[p]/1024,m[p]/c[p]}}'
 }
 
 function version {

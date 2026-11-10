@@ -21,10 +21,13 @@ Changes for CBE.next
 
 * `slurm top` and `slurm cpus jobs|queue` take memory and GPUs from the job TRES (`squeue -O tres-alloc`).
   Upstream assumed `%m` was plain MB, which gives wrong totals with current Slurm (`8G`).
-* `slurm top`, `slurm cpus jobs|queue` and `slurm qos` show GPU counts.
+* `slurm top` and `slurm cpus jobs|queue` show full GPUs and MIG slices in separate columns,
+  split by GPU type (MIG types carry a profile such as `_1g.23gb`). Pending jobs that request
+  a GPU without a type count as full GPUs.
+* `slurm qos` shows GPU limits; these are set as plain `gres/gpu` and do not distinguish MIG.
 * `slurm qos` reads `GrpTRES` and `MaxTRESPU` instead of `GrpCPUs` and `MaxCPUsPerUser`.
 * `slurm qos <user>` asks `sacctmgr` for the `QOS` field by name, as its position changed.
-* `slurm nodes` shows the node GRES.
+* `slurm nodes` shows the node GRES, wide enough for the MIG GRES names.
 * The `makeversion` script is removed; the version is fixed as `1.0.1-cbe`.
 
 Installation
