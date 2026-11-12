@@ -1,6 +1,7 @@
 # Slurm tools
 
 This project is licensed under the GNU General Public License v3.0.
+The third-party [slurm_tool](slurm_tool/) subdirectory is licensed under the GNU General Public License v2.0, see [slurm_tool/LICENSE](slurm_tool/LICENSE).
 The DOI link to these tools is https://doi.org/10.5281/zenodo.15261429
 
 These [Slurm](https://slurm.schedmd.com/overview.html)
@@ -35,6 +36,8 @@ tools have been developed for management and monitoring of our cluster:
 14. Tools for managing [InfiniBand and Omni-Path](InfiniBand/) network fabrics.
 
 15. [Command completions](bash-completion/) for our Slurm tools.
+
+16. [slurm_tool](slurm_tool/) Easy to use `slurm` wrapper for read-only Slurm commands (third-party, GPLv2).
 
 Slurm deployment HOWTO
 ----------------------

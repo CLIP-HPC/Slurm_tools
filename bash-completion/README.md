@@ -79,3 +79,8 @@ where application-specific files are sourced when a user logs in:
 ```
 cp slurm_tools_completion.sh /etc/profile.d/
 ```
+
+The [slurm_tool](../slurm_tool/) wrapper ```slurm``` gets completion of its subcommands, also after ```slurm watch```:
+```
+slurm s[TAB][TAB]
+```

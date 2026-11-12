@@ -57,5 +57,15 @@ then
 		complete -o nospace -F _hostlist psnode
 		complete -o nospace -F _hostlist spowerdown
 		complete -o nospace -F _hostlist spowerup
+
+		# slurm_tool: complete the subcommand, also after "watch"
+		function _slurm_tool() {
+			local cur="${COMP_WORDS[COMP_CWORD]}" prev="${COMP_WORDS[COMP_CWORD-1]}"
+			if [ "$COMP_CWORD" -eq 1 ] || { [ "$COMP_CWORD" -eq 2 ] && [[ $prev == @(w|watch) ]]; }
+			then
+				COMPREPLY=($(compgen -W "watch queue quick short shorter full qos top prio job steps history shares partitions nodes cpus features dead user version" -- "$cur"))
+			fi
+		}
+		complete -F _slurm_tool slurm
 	fi
 fi
