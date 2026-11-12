@@ -28,6 +28,29 @@ Some convenient scripts for managing Slurm jobs:
 
 * ```schedjobs```: Stop or start job scheduling in ALL Slurm partitions
 
+* ```jobeff```: Show CPU and memory efficiency of jobs from ```sacct```: ```jobeff <jobid>``` or ```jobeff --me```.
+
+* ```jobinfo```: Show resource usage of a single job, with hints about inefficient requests: ```jobinfo <jobid>```.
+
+Origin and license of jobeff and jobinfo
+----------------------------------------
+
+Both scripts were copied from other sites and are licensed differently from the rest of this repository (GPLv3).
+
+* ```jobeff``` is from https://github.com/uschpc/slurm-tools (```scripts/jobeff```, commit 09b59a7, version 1.0.1),
+  copyright (c) 2024-2026 USC Center for Advanced Research Computing, licensed under 0BSD, see [LICENSE.jobeff](LICENSE.jobeff).
+* ```jobinfo``` is from https://github.com/rug-cit-hpc/hb-jobinfo (```jobinfo```, commit e1bb567),
+  written by Fokke Dijkstra, copyright (c) 2024 High Performance Computing - Center for Information Technology,
+  University of Groningen, licensed under MIT, see [LICENSE.jobinfo](LICENSE.jobinfo).
+  It was inspired by ```jobinfo``` from https://github.com/birc-aeh/slurm-utils by Anders Halager.
+
+Changes for CBE.next:
+
+* Both: the support contact in the help text points to the HPC Servicedesk.
+* ```jobinfo```: shows the ```Account``` field.
+* ```jobinfo```: treats a job as a GPU job when it requested GPUs, instead of looking for ```gpu``` in the partition name
+  (the ```gpu_partition_label``` setting is removed).
+
 GPU monitoring
 --------------
 
