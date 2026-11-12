@@ -15,6 +15,7 @@ Notes:
   - Based on output from sacct
   - Default time period is past day
   - State filter is based on current job state
+  - GPU columns need AccountingStorageTRES with gres/gpumem and gres/gpuutil
 
 Origin:
   - From https://github.com/uschpc/slurm-tools (scripts/jobeff, commit 09b59a7, version 1.0.1)
@@ -29,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 
 # Set up arguments and options ###########################################################
 
@@ -153,7 +155,7 @@ if not any(vars(args).values()):
     sys.exit(1)
 
 if args.version:
-    print("jobeff 1.0.1")
+    print("jobeff 1.0.1+cbe.1")
     sys.exit(0)
 
 # Define utility functions ###############################################################
@@ -215,6 +217,69 @@ def tobytes(x):
     if scale != 1:
         x = x[:-1]
     return float(x) * scale
+
+def tosize(x):
+    """
+    Convert bytes to string with unit
+
+    # Arguments
+    - x (float): size in bytes
+
+    # Returns
+    - str: size with unit (e.g. 52.7G)
+    """
+    for unit in ["", "K", "M", "G", "T"]:
+        if x < 1024 or unit == "T":
+            break
+        x = x / 1024
+    if unit == "":
+        return f"{x:.0f}"
+    return f"{x:.1f}{unit}"
+
+def fitwidth(x, width):
+    """
+    Truncate and left-align string to display width
+
+    # Arguments
+    - x (str): string to fit (e.g. job name)
+    - width (int): display width
+
+    # Returns
+    - str: string padded to width
+
+    # Notes
+    - Wide characters (e.g. CJK) take two columns, combining characters none
+    """
+    out = ""
+    used = 0
+    for c in x:
+        if unicodedata.combining(c):
+            w = 0
+        elif unicodedata.east_asian_width(c) in "WF":
+            w = 2
+        else:
+            w = 1
+        if used + w > width:
+            break
+        out = out + c
+        used = used + w
+    return out + " " * (width - used)
+
+def pctbar(x):
+    """
+    Create percentage visual using line of | up to length 10
+
+    # Arguments
+    - x (str): formatted % or "--"
+
+    # Returns
+    - str: "" (if x is "--")
+    - str: formatted % with visual
+    """
+    if x == "--":
+        return ""
+    n = round(float(x[:-1]) / 10)
+    return x + " [" + f"{('|' * n)[:10]:<10}" + "]"
 
 # Define selector functions ##############################################################
 
@@ -430,7 +495,43 @@ def derivev(vals):
         d["maxmem"] = max(allmembytes)
     # Calculate memory efficiency
     d["memeff"] = memeff(d["maxmem"], d["allocmem"])
+    # Derive GPU peak usage
+    d.update(gpupeak(d["alloctres"], d["tresusageinmax"]))
     return d
+
+def gpupeak(alloctres, tresusageinmax):
+    """
+    Derive peak GPU utilization and memory from sacct values
+
+    # Arguments
+    - alloctres (str): sacct value for alloctres
+    - tresusageinmax (str): sacct values for tresusageinmax (separated by |)
+
+    # Returns
+    - dict: gpus (int), gpuutil (str), gpumem (str)
+
+    # Notes
+    - gpuutil is the sum over all GPUs of a step, so divide by the number of GPUs
+    - gpuutil is always 0 on MIG slices, so report n/a
+    - gpuutil and gpumem are "-" for jobs without GPUs and "--" if not available
+    """
+    gpus = re.search(r"gres/gpu=([0-9]+)", alloctres)
+    if not gpus:
+        return {"gpus": 0, "gpuutil": "-", "gpumem": "-"}
+    ngpus = int(gpus.group(1))
+    allutil = re.findall(r"gres/gpuutil=([0-9]+)", tresusageinmax)
+    allmem = re.findall(r"gres/gpumem=([0-9]+.[0-9]+[A-Z]|[0-9]+[A-Z]?)", tresusageinmax)
+    if re.search(r"gres/gpu:[^=,]*_[0-9]+g\.[0-9]+gb=", alloctres):
+        gpuutil = "n/a"
+    elif allutil:
+        gpuutil = f"{max(int(util) for util in allutil) / ngpus:5.2f}%"
+    else:
+        gpuutil = "--"
+    if allmem:
+        gpumem = tosize(max(tobytes(mem) for mem in allmem))
+    else:
+        gpumem = "--"
+    return {"gpus": ngpus, "gpuutil": gpuutil, "gpumem": gpumem}
 
 # Define main function to get job efficiency values ######################################
 
@@ -462,7 +563,8 @@ fs = [["jobid", firstv],
       ["alloctres", firstv],
       ["cputime", firstv],
       ["totalcpu", firstv],
-      ["tresusageintot", allv]]
+      ["tresusageintot", allv],
+      ["tresusageinmax", allv]]
 
 # Derive sacct command stem based on given arguments
 if args.jobids:
@@ -534,25 +636,28 @@ if not res:
 
 if not args.summary:
     # Print table of job efficiency values
-    print("------------------------------------------------------------------")
-    print("Job ID             State       CPU Efficiency    Memory Efficiency")
-    print("------------- ---------- -------------------- --------------------")
+    # Show GPU columns only if any listed job has GPUs
+    gpucols = any(job["gpus"] > 0 for job in res)
+    cols = [["Job ID", 13, "<"], ["Job Name", 20, "<"], ["State", 10, ">"],
+            ["CPU Efficiency", 20, ">"], ["Memory Efficiency", 20, ">"]]
+    if gpucols:
+        cols = cols + [["GPU Util Peak", 20, ">"], ["GPU Mem Peak", 12, ">"]]
+    print("-" * (sum(col[1] for col in cols) + len(cols) - 1))
+    print(" ".join(f"{name:{align}{width}}" for name, width, align in cols))
+    print(" ".join("-" * width for name, width, align in cols))
     for job in res:
-        # Create percentage visuals using line of | up to length 10
-        if job["cpueff"] == "--":
-            vcpueff = ""
-        else:
-            n1 = round(float(job["cpueff"][:-1]) / 10)
-            vcpueff = job["cpueff"] + " [" + f"{('|' * n1)[:10]:<10}" + "]"
-        if job["memeff"] == "--":
-            vmemeff = ""
-        else:
-            n2 = round(float(job["memeff"][:-1]) / 10)
-            vmemeff = job["memeff"] + " [" + f"{('|' * n2)[:10]:<10}" + "]"
-        print(f"{job['jobid'][:13]:<13}" + " " +
-              f"{job['state'][:10]:>10}" + " " +
-              f"{vcpueff[:20]:>20}" + " " +
-              f"{vmemeff[:20]:>20}")
+        line = (f"{job['jobid'][:13]:<13}" + " " +
+                fitwidth(job["jobname"], 20) + " " +
+                f"{job['state'][:10]:>10}" + " " +
+                f"{pctbar(job['cpueff'])[:20]:>20}" + " " +
+                f"{pctbar(job['memeff'])[:20]:>20}")
+        if gpucols:
+            if job["gpuutil"] in ["-", "--", "n/a"]:
+                vgpuutil = job["gpuutil"]
+            else:
+                vgpuutil = pctbar(job["gpuutil"])
+            line = line + " " + f"{vgpuutil[:20]:>20}" + " " + f"{job['gpumem'][:12]:>12}"
+        print(line)
 else:
     # Print five-number summaries for job efficiency values
     # Exclude jobs without efficiency values

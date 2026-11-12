@@ -47,6 +47,12 @@ Both scripts were copied from other sites and are licensed differently from the 
 Changes for CBE.next:
 
 * Both: the support contact in the help text points to the HPC Servicedesk.
+* ```jobeff```: the table shows the job name (first 20 characters).
+* ```jobeff```: if any listed job has GPUs, the table shows its peak GPU utilization (per GPU, from ```gres/gpuutil```)
+  and peak GPU memory (summed over the job's GPUs, from ```gres/gpumem```), both taken from ```TRESUsageInMax```.
+  Jobs without GPUs show ```-```; MIG slices show ```n/a``` for utilization, as Slurm reports 0 for them.
+  This needs ```gres/gpumem``` and ```gres/gpuutil``` in ```AccountingStorageTRES```.
+* ```jobeff```: the version is ```1.0.1+cbe.1```.
 * ```jobinfo```: shows the ```Account``` field.
 * ```jobinfo```: treats a job as a GPU job when it requested GPUs, instead of looking for ```gpu``` in the partition name
   (the ```gpu_partition_label``` setting is removed).
