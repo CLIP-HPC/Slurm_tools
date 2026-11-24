@@ -10,6 +10,11 @@
 # from Anders Halager  <aeh@birc.au.dk>
 #
 # LICENSE, MIT
+#
+# From https://github.com/rug-cit-hpc/hb-jobinfo (jobinfo, commit e1bb567)
+# Copyright (c) 2024 High Performance Computing - Center for Information
+# Technology, University of Groningen; see LICENSE.jobinfo
+# Changes for CBE.next are listed in README.md
 
 import sys
 import subprocess
@@ -757,7 +762,8 @@ and historical jobs.
 Usage:
     jobinfo <job id>
 
-Report problems to hpc@rug.nl'''
+Report problems to the HPC Servicedesk:
+https://vbc.atlassian.net/servicedesk/customer/portal/5/group/6'''
 
     print(usage_msg, file=pipe)
 
