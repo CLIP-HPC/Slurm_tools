@@ -135,6 +135,13 @@ check("--gpus-per-task without --ntasks is rejected",
 	job{ partition = "g", tres_per_task = "gres/gpu:1" }, slurm.ESLURM_BAD_TASK_COUNT)
 check("--gpus-per-task with --ntasks is accepted",
 	job{ partition = "g", tres_per_task = "gres/gpu:1", num_tasks = 2 }, OK)
+check("--gres=gpu:1 --cpus-per-task=2 without --ntasks is accepted",
+	job{ partition = "g", tres_per_node = "gres/gpu:1", tres_per_task = "cpu=2" }, OK)
+check("salloc with a MIG slice and --cpus-per-task=4 gets interactive_gpu",
+	job{ partition = "g", script = "", tres_per_node = "gres/gpu:nvidia_b200_1g.23gb:1",
+		tres_per_task = "cpu=4" }, OK, { qos = "interactive", reservation = "interactive_gpu" })
+check("--gpus-per-task with --cpus-per-task without --ntasks is rejected",
+	job{ partition = "g", tres_per_task = "cpu=2,gres/gpu:1" }, slurm.ESLURM_BAD_TASK_COUNT)
 check("--exclusive --gpus=1 is accepted",
 	job{ partition = "g", tres_per_job = "gres/gpu:1", shared = 0 }, OK, { min_mem_per_node = 0 })
 check("--exclusive with a MIG slice is accepted",
@@ -187,6 +194,19 @@ modify("modify to gpu:2 on g is accepted", with{ tres_per_node = "gres/gpu:2" },
 	{ partition = "g", num_tasks = slurm.NO_VAL }, OK)
 modify("modify without GRES change is accepted", with{ time_limit = 30 },
 	{ partition = "g", num_tasks = slurm.NO_VAL }, OK)
+modify("modify of only --cpus-per-task on g is accepted", with{ tres_per_task = "cpu=4" },
+	{ partition = "g", num_tasks = slurm.NO_VAL }, OK)
+modify("modify to shard:1 on g is rejected", with{ tres_per_node = "gres/shard:1" },
+	{ partition = "g", num_tasks = slurm.NO_VAL }, GRES)
+modify("modify to gres=none on g is rejected", with{ tres_per_node = "gres/none" },
+	{ partition = "g", num_tasks = slurm.NO_VAL }, GRES)
+modify("modify to empty TresPerNode on g is rejected", with{ tres_per_node = "" },
+	{ partition = "g", num_tasks = slurm.NO_VAL }, GRES)
+modify("modify to empty TresPerTask on g is rejected", with{ tres_per_task = "" },
+	{ partition = "g", num_tasks = slurm.NO_VAL }, GRES)
+modify("modify to only cpu per task with gres=none on g is rejected",
+	with{ tres_per_node = "gres/none", tres_per_task = "cpu=4" },
+	{ partition = "g", num_tasks = slurm.NO_VAL }, GRES)
 
 print(string.format("%d tests, %d failures", count, failures))
 os.exit(failures == 0 and 0 or 1)
