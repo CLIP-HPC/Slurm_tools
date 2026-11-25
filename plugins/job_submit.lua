@@ -129,6 +129,23 @@ function count_gpus (tres)
 	return total, named
 end
 
+-- True if the TRES string has an entry other than cpu=N (stored there by --cpus-per-task)
+-- An empty string (e.g. scontrol update TresPerNode=) clears the TRES, so it counts too
+function has_non_cpu_tres (tres)
+	if tres == nil then
+		return false
+	end
+	if tres == "" then
+		return true
+	end
+	for spec in string.gmatch(tres, "[^,]+") do
+		if not string.match(spec, "^cpu[:=]%d+$") then
+			return true
+		end
+	end
+	return false
+end
+
 -- Sum count_gpus over the --gpus*/--gres fields of job_desc
 -- (job_desc.gres is an alias of tres_per_node, so it is not counted separately)
 function count_job_gpus (job_desc)
@@ -419,8 +436,10 @@ function check_gpu_request (job_desc, p, part, log_prefix)
 		slurm.log_user(script_error)
 		return slurm.ESLURM_INVALID_GRES
 	end
-	if (job_desc.tres_per_socket ~= nil or job_desc.tres_per_task ~= nil) and
-			job_desc.num_tasks == slurm.NO_VAL then
+	-- Only GPU entries count: --cpus-per-task is also stored in tres_per_task (cpu=N)
+	local _, gpus_per_task = count_gpus(job_desc.tres_per_task)
+	local _, gpus_per_socket = count_gpus(job_desc.tres_per_socket)
+	if (gpus_per_task or gpus_per_socket) and job_desc.num_tasks == slurm.NO_VAL then
 		slurm.log_user("--gpus-per-task and --gpus-per-socket options require --ntasks specification")
 		slurm.log_user(script_error)
 		return slurm.ESLURM_BAD_TASK_COUNT
@@ -430,9 +449,9 @@ end
 
 -- Sanity check of modified GPU requests in GPU partitions
 function modify_gpus (job_desc, job_ptr, part_list, modify_uid, log_prefix)
-	if job_desc.tres_per_job == nil and job_desc.tres_per_node == nil and
-			job_desc.tres_per_socket == nil and job_desc.tres_per_task == nil then
-		-- The case where the modify request does not modify the GPUs
+	if not has_non_cpu_tres(job_desc.tres_per_job) and not has_non_cpu_tres(job_desc.tres_per_node) and
+			not has_non_cpu_tres(job_desc.tres_per_socket) and not has_non_cpu_tres(job_desc.tres_per_task) then
+		-- The modify request does not modify the GPUs (at most --cpus-per-task)
 		return slurm.SUCCESS
 	end
 	for i, p in ipairs(partitions) do
